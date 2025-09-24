@@ -3,6 +3,9 @@ import { getServerSession } from 'next-auth';
 import { testEngine } from '@/lib/email/test-engine';
 import { authOptions } from '@/lib/auth';
 
+// Force dynamic rendering
+export const dynamic = 'force-dynamic';
+
 interface TestRequest {
   testType: 'full' | 'performance' | 'accuracy' | 'custom';
   tags?: string[];

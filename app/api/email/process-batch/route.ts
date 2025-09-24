@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { EmailBackgroundProcessor, ProcessingOptions } from '@/lib/email/background-processor';
 
+// Force dynamic rendering
+export const dynamic = 'force-dynamic';
+
 interface ProcessBatchRequest {
   jobId: string;
   startIndex: number;

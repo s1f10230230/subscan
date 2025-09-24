@@ -4,6 +4,9 @@ import { EmailBackgroundProcessor, ProcessingOptions } from '@/lib/email/backgro
 import { authOptions } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 
+// Force dynamic rendering
+export const dynamic = 'force-dynamic';
+
 interface StartJobRequest {
   maxEmails?: number;
   confidenceThreshold?: number;

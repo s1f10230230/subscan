@@ -5,6 +5,9 @@ import { getGmailClientForUser } from '@/lib/email/gmail';
 import { prisma } from '@/lib/prisma';
 import { authOptions } from '@/lib/auth';
 
+// Force dynamic rendering
+export const dynamic = 'force-dynamic';
+
 interface DetectSubscriptionsRequest {
   dateRange?: {
     start: string;

@@ -4,6 +4,9 @@ import { emailErrorManager, EmailProcessingErrorType } from '@/lib/email/error-m
 import { authOptions } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 
+// Force dynamic rendering
+export const dynamic = 'force-dynamic';
+
 /**
  * エラー統計取得API
  */
