@@ -5,7 +5,7 @@ import { prisma } from "@/lib/prisma"
 import { encrypt } from "@/lib/encryption"
 
 export const authOptions: NextAuthOptions = {
-  adapter: PrismaAdapter(prisma),
+  // adapter: PrismaAdapter(prisma), // Temporarily disabled for deployment
   secret: process.env.NEXTAUTH_SECRET,
   providers: [
     GoogleProvider({
