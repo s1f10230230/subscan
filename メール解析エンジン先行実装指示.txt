@@ -1,0 +1,1018 @@
+# メール解析エンジン先行実装指示書
+
+## 概要
+Gmail API連携によるクレジットカード利用通知・サブスクリプション検知機能の技術検証実装。本格開発前にコアアルゴリズムの実現可能性と精度を確認する。
+
+## 技術検証目標
+- **精度目標**: 主要サービス（Netflix、楽天カード等）90%以上の検知精度
+- **パフォーマンス目標**: 100件のメール処理を10秒以内
+- **Vercel制限回避**: 15秒実行制限内でのバックグラウンド処理実現
+
+## Phase 1: Gmail API基盤（推定1週間）
+
+### 実装ファイル構成
+```
+lib/
+├── email/
+│   ├── gmail-client.ts      # Gmail API クライアント
+│   ├── oauth-manager.ts     # OAuth2 トークン管理
+│   ├── email-fetcher.ts     # メール取得・検索
+│   └── types.ts            # 型定義
+├── auth.ts                  # NextAuth設定（Gmail OAuth用）
+└── encryption.ts           # トークン暗号化
+
+app/api/
+├── auth/[...nextauth]/route.ts  # Gmail OAuth対応
+├── email/
+│   ├── connect/route.ts     # Gmail接続API
+│   ├── test-fetch/route.ts  # テスト用メール取得
+│   └── oauth-callback/route.ts # OAuth コールバック
+
+components/
+└── email/
+    ├── GmailConnector.tsx   # Gmail接続UI
+    └── EmailTestViewer.tsx  # 取得メール表示（デバッグ用）
+
+pages/
+└── email-test.tsx          # メール取得テストページ
+```
+
+### 1.1 Gmail OAuth設定
+```typescript
+// lib/auth.ts - NextAuth設定拡張
+import NextAuth from "next-auth";
+import GoogleProvider from "next-auth/providers/google";
+
+export default NextAuth({
+  providers: [
+    GoogleProvider({
+      clientId: process.env.GOOGLE_CLIENT_ID!,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+      authorization: {
+        params: {
+          scope: [
+            "openid",
+            "email", 
+            "profile",
+            "https://www.googleapis.com/auth/gmail.readonly"
+          ].join(" "),
+          access_type: "offline",
+          prompt: "consent"
+        }
+      }
+    })
+  ],
+  callbacks: {
+    async jwt({ token, account }) {
+      if (account && account.provider === "google") {
+        // Gmail アクセストークンを暗号化して保存
+        token.gmail_access_token = encrypt(account.access_token!);
+        token.gmail_refresh_token = encrypt(account.refresh_token!);
+        token.gmail_expires_at = account.expires_at;
+      }
+      return token;
+    }
+  }
+});
+```
+
+### 1.2 Gmail API クライアント
+```typescript
+// lib/email/gmail-client.ts
+import { google } from 'googleapis';
+
+export class GmailClient {
+  private gmail: any;
+  
+  constructor(private accessToken: string) {
+    const auth = new google.auth.OAuth2();
+    auth.setCredentials({ access_token: accessToken });
+    this.gmail = google.gmail({ version: 'v1', auth });
+  }
+
+  /**
+   * メール検索（カード会社・サブスクサービスに特化）
+   */
+  async searchEmails(options: {
+    dateRange: { start: Date; end: Date };
+    maxResults?: number;
+  }): Promise<EmailMessage[]> {
+    try {
+      // 特定の送信者に絞った検索クエリ
+      const senders = [
+        'noreply@account.netflix.com',
+        'spotify.com',
+        'rakuten-card.co.jp',
+        'vpass.ne.jp',       // 三井住友カード
+        'jcb.co.jp',
+        'amazon.co.jp',
+        'adobe.com'
+      ];
+      
+      const query = this.buildSearchQuery(senders, options.dateRange);
+      
+      const response = await this.gmail.users.messages.list({
+        userId: 'me',
+        q: query,
+        maxResults: options.maxResults || 100
+      });
+
+      if (!response.data.messages) {
+        return [];
+      }
+
+      // メッセージの詳細を並列取得
+      const messages = await Promise.all(
+        response.data.messages.map(async (msg: any) => {
+          const detail = await this.gmail.users.messages.get({
+            userId: 'me',
+            id: msg.id,
+            format: 'full'
+          });
+          
+          return this.parseEmailMessage(detail.data);
+        })
+      );
+
+      return messages;
+    } catch (error) {
+      throw new GmailApiError('メール検索に失敗しました', error);
+    }
+  }
+
+  private buildSearchQuery(senders: string[], dateRange: { start: Date; end: Date }): string {
+    const senderQuery = senders.map(sender => `from:${sender}`).join(' OR ');
+    const dateQuery = `after:${this.formatGmailDate(dateRange.start)} before:${this.formatGmailDate(dateRange.end)}`;
+    const keywordQuery = 'subject:(利用 OR 支払い OR payment OR subscription OR お知らせ)';
+    
+    return `(${senderQuery}) AND ${dateQuery} AND ${keywordQuery}`;
+  }
+
+  private parseEmailMessage(gmailMessage: any): EmailMessage {
+    const headers = gmailMessage.payload.headers;
+    const getHeader = (name: string) => 
+      headers.find((h: any) => h.name.toLowerCase() === name.toLowerCase())?.value || '';
+
+    let body = '';
+    if (gmailMessage.payload.body?.data) {
+      body = Buffer.from(gmailMessage.payload.body.data, 'base64').toString();
+    } else if (gmailMessage.payload.parts) {
+      // マルチパート対応
+      for (const part of gmailMessage.payload.parts) {
+        if (part.mimeType === 'text/plain' && part.body?.data) {
+          body = Buffer.from(part.body.data, 'base64').toString();
+          break;
+        }
+      }
+    }
+
+    return {
+      id: gmailMessage.id,
+      subject: getHeader('Subject'),
+      sender: getHeader('From'),
+      receivedDate: new Date(parseInt(gmailMessage.internalDate)),
+      body: body
+    };
+  }
+
+  private formatGmailDate(date: Date): string {
+    return date.toISOString().split('T')[0].replace(/-/g, '/');
+  }
+}
+
+export interface EmailMessage {
+  id: string;
+  subject: string;
+  sender: string;
+  receivedDate: Date;
+  body: string;
+}
+
+class GmailApiError extends Error {
+  constructor(message: string, public originalError: any) {
+    super(message);
+    this.name = 'GmailApiError';
+  }
+}
+```
+
+### 1.3 テスト用API
+```typescript
+// app/api/email/test-fetch/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { getServerSession } from 'next-auth';
+import { GmailClient } from '@/lib/email/gmail-client';
+import { decrypt } from '@/lib/encryption';
+
+export async function GET(req: NextRequest) {
+  try {
+    const session = await getServerSession();
+    if (!session?.gmail_access_token) {
+      return NextResponse.json({ error: 'Gmail未接続' }, { status: 401 });
+    }
+
+    const accessToken = decrypt(session.gmail_access_token);
+    const gmail = new GmailClient(accessToken);
+
+    // 過去1ヶ月のメールを取得（テスト用）
+    const dateRange = {
+      start: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
+      end: new Date()
+    };
+
+    const emails = await gmail.searchEmails({
+      dateRange,
+      maxResults: 50
+    });
+
+    return NextResponse.json({
+      success: true,
+      data: {
+        emailCount: emails.length,
+        emails: emails.map(email => ({
+          id: email.id,
+          subject: email.subject,
+          sender: email.sender,
+          receivedDate: email.receivedDate,
+          bodyLength: email.body.length
+        }))
+      }
+    });
+
+  } catch (error) {
+    console.error('Gmail test fetch error:', error);
+    return NextResponse.json({
+      success: false,
+      error: error.message
+    }, { status: 500 });
+  }
+}
+```
+
+## Phase 2: パターンマッチング・データ抽出エンジン（推定1.5週間）
+
+### 実装ファイル構成
+```
+lib/email/
+├── patterns/
+│   ├── subscription-patterns.ts    # サブスクパターン定義
+│   ├── card-patterns.ts           # クレカパターン定義
+│   └── pattern-matcher.ts         # パターンマッチャー
+├── extractors/
+│   ├── amount-extractor.ts        # 金額抽出
+│   ├── merchant-extractor.ts      # 店舗名抽出
+│   ├── date-extractor.ts          # 日付抽出
+│   └── base-extractor.ts          # 基底クラス
+├── parser.ts                      # メイン解析エンジン
+└── validation.ts                  # 抽出結果検証
+
+__tests__/
+├── email/
+│   ├── fixtures/                  # テストメールサンプル
+│   ├── parser.test.ts            # パーサーテスト
+│   └── patterns.test.ts          # パターンテスト
+```
+
+### 2.1 サブスクリプションパターン定義
+```typescript
+// lib/email/patterns/subscription-patterns.ts
+export interface SubscriptionPattern {
+  serviceName: string;
+  senderPatterns: RegExp[];
+  subjectPatterns: RegExp[];
+  amountPatterns: {
+    regex: RegExp;
+    currencyGroup: number;
+    amountGroup: number;
+  }[];
+  merchantPatterns: RegExp[];
+  billingCycle: 'MONTHLY' | 'YEARLY' | 'WEEKLY';
+  confidence: number; // 0.0 - 1.0
+  testCases: TestCase[];
+}
+
+interface TestCase {
+  email: {
+    subject: string;
+    sender: string;
+    body: string;
+  };
+  expected: {
+    amount: number;
+    currency: string;
+    merchantName: string;
+  };
+}
+
+export const SUBSCRIPTION_PATTERNS: SubscriptionPattern[] = [
+  {
+    serviceName: 'Netflix',
+    senderPatterns: [
+      /noreply@account\.netflix\.com/i,
+      /info@account\.netflix\.com/i
+    ],
+    subjectPatterns: [
+      /netflix.*お支払い.*お知らせ/i,
+      /netflix.*payment.*confirmation/i,
+      /netflix.*receipt/i
+    ],
+    amountPatterns: [
+      {
+        regex: /¥([0-9,]+)/,
+        currencyGroup: 0,
+        amountGroup: 1
+      },
+      {
+        regex: /JPY\s*([0-9,]+)/i,
+        currencyGroup: 0,
+        amountGroup: 1
+      },
+      {
+        regex: /([0-9,]+)円/,
+        currencyGroup: 0,
+        amountGroup: 1
+      }
+    ],
+    merchantPatterns: [/Netflix/i],
+    billingCycle: 'MONTHLY',
+    confidence: 0.95,
+    testCases: [
+      {
+        email: {
+          subject: 'Netflix - お支払いのお知らせ',
+          sender: 'noreply@account.netflix.com',
+          body: 'Netflix プレミアムプランの月額料金 ¥1,490 のお支払いが完了しました。'
+        },
+        expected: {
+          amount: 1490,
+          currency: 'JPY',
+          merchantName: 'Netflix'
+        }
+      }
+    ]
+  },
+  
+  {
+    serviceName: 'Spotify',
+    senderPatterns: [
+      /noreply@spotify\.com/i,
+      /info@spotify\.com/i
+    ],
+    subjectPatterns: [
+      /spotify.*premium/i,
+      /spotify.*subscription/i,
+      /spotify.*お支払い/i
+    ],
+    amountPatterns: [
+      {
+        regex: /\$([0-9.]+)/,
+        currencyGroup: 0,
+        amountGroup: 1
+      },
+      {
+        regex: /¥([0-9,]+)/,
+        currencyGroup: 0,
+        amountGroup: 1
+      }
+    ],
+    merchantPatterns: [/Spotify/i],
+    billingCycle: 'MONTHLY',
+    confidence: 0.90,
+    testCases: [
+      {
+        email: {
+          subject: 'Your Spotify Premium subscription',
+          sender: 'noreply@spotify.com',
+          body: 'Thank you for your Spotify Premium subscription. Amount: $9.99'
+        },
+        expected: {
+          amount: 9.99,
+          currency: 'USD',
+          merchantName: 'Spotify'
+        }
+      }
+    ]
+  }
+];
+```
+
+### 2.2 メイン解析エンジン
+```typescript
+// lib/email/parser.ts
+import { EmailMessage } from './gmail-client';
+import { SUBSCRIPTION_PATTERNS } from './patterns/subscription-patterns';
+import { CARD_PATTERNS } from './patterns/card-patterns';
+import { AmountExtractor } from './extractors/amount-extractor';
+import { MerchantExtractor } from './extractors/merchant-extractor';
+
+export interface ParseResult {
+  success: boolean;
+  confidence: number; // 0.0 - 1.0
+  type: 'SUBSCRIPTION' | 'TRANSACTION' | 'UNKNOWN';
+  data?: {
+    amount: number;
+    currency: string;
+    merchantName: string;
+    serviceName?: string;
+    billingCycle?: string;
+  };
+  errors: string[];
+  matchedPattern?: string;
+}
+
+export class EmailParser {
+  private amountExtractor = new AmountExtractor();
+  private merchantExtractor = new MerchantExtractor();
+
+  async parseEmail(email: EmailMessage): Promise<ParseResult> {
+    try {
+      // 1. サブスクリプションパターンチェック
+      const subscriptionResult = await this.checkSubscriptionPatterns(email);
+      if (subscriptionResult.success && subscriptionResult.confidence >= 0.7) {
+        return subscriptionResult;
+      }
+
+      // 2. クレジットカード利用通知パターンチェック
+      const cardResult = await this.checkCardPatterns(email);
+      if (cardResult.success && cardResult.confidence >= 0.7) {
+        return cardResult;
+      }
+
+      // 3. 汎用パターン（フォールバック）
+      const genericResult = await this.genericParsing(email);
+      
+      return {
+        success: genericResult.success,
+        confidence: Math.max(subscriptionResult.confidence, cardResult.confidence, genericResult.confidence),
+        type: genericResult.type,
+        data: genericResult.data,
+        errors: [...subscriptionResult.errors, ...cardResult.errors, ...genericResult.errors],
+        matchedPattern: 'GENERIC'
+      };
+
+    } catch (error) {
+      return {
+        success: false,
+        confidence: 0,
+        type: 'UNKNOWN',
+        errors: [`Parse error: ${error.message}`]
+      };
+    }
+  }
+
+  private async checkSubscriptionPatterns(email: EmailMessage): Promise<ParseResult> {
+    const emailText = `${email.subject} ${email.body}`.toLowerCase();
+    const errors: string[] = [];
+
+    for (const pattern of SUBSCRIPTION_PATTERNS) {
+      try {
+        // 送信者チェック
+        const senderMatch = pattern.senderPatterns.some(p => p.test(email.sender));
+        if (!senderMatch) continue;
+
+        // 件名チェック
+        const subjectMatch = pattern.subjectPatterns.some(p => p.test(email.subject));
+        if (!subjectMatch) continue;
+
+        // 金額抽出
+        const amountResult = await this.extractAmountFromPattern(email, pattern);
+        if (!amountResult.success) {
+          errors.push(`${pattern.serviceName}: 金額抽出失敗`);
+          continue;
+        }
+
+        // 店舗名抽出
+        const merchantResult = await this.extractMerchantFromPattern(email, pattern);
+
+        return {
+          success: true,
+          confidence: pattern.confidence,
+          type: 'SUBSCRIPTION',
+          data: {
+            amount: amountResult.amount!,
+            currency: amountResult.currency!,
+            merchantName: merchantResult.merchantName || pattern.serviceName,
+            serviceName: pattern.serviceName,
+            billingCycle: pattern.billingCycle
+          },
+          errors: [],
+          matchedPattern: pattern.serviceName
+        };
+
+      } catch (error) {
+        errors.push(`${pattern.serviceName}: ${error.message}`);
+      }
+    }
+
+    return {
+      success: false,
+      confidence: 0,
+      type: 'UNKNOWN',
+      errors
+    };
+  }
+
+  private async extractAmountFromPattern(
+    email: EmailMessage, 
+    pattern: SubscriptionPattern
+  ): Promise<{success: boolean; amount?: number; currency?: string}> {
+    const content = `${email.subject} ${email.body}`;
+
+    for (const amountPattern of pattern.amountPatterns) {
+      const match = content.match(amountPattern.regex);
+      if (match) {
+        const amountStr = match[amountPattern.amountGroup];
+        const amount = parseFloat(amountStr.replace(/,/g, ''));
+        
+        if (!isNaN(amount) && amount > 0) {
+          const currency = this.detectCurrency(match[0]);
+          return { success: true, amount, currency };
+        }
+      }
+    }
+
+    return { success: false };
+  }
+
+  private detectCurrency(text: string): string {
+    if (text.includes('¥') || text.includes('円') || text.includes('JPY')) return 'JPY';
+    if (text.includes('$') || text.includes('USD')) return 'USD';
+    if (text.includes('€') || text.includes('EUR')) return 'EUR';
+    return 'JPY'; // デフォルト
+  }
+
+  private async genericParsing(email: EmailMessage): Promise<ParseResult> {
+    // 汎用的なパターンマッチング
+    const content = `${email.subject} ${email.body}`;
+    
+    // 金額抽出（複数パターン試行）
+    const amountResult = await this.amountExtractor.extract(content);
+    if (!amountResult.success) {
+      return {
+        success: false,
+        confidence: 0,
+        type: 'UNKNOWN',
+        errors: ['金額が見つかりませんでした']
+      };
+    }
+
+    // 店舗名抽出
+    const merchantResult = await this.merchantExtractor.extract(content);
+
+    return {
+      success: true,
+      confidence: 0.4, // 低信頼度
+      type: 'TRANSACTION',
+      data: {
+        amount: amountResult.amount!,
+        currency: amountResult.currency!,
+        merchantName: merchantResult.merchantName || '不明'
+      },
+      errors: [],
+      matchedPattern: 'GENERIC'
+    };
+  }
+}
+```
+
+### 2.3 テストケース実装
+```typescript
+// __tests__/email/parser.test.ts
+import { EmailParser } from '@/lib/email/parser';
+import { SUBSCRIPTION_PATTERNS } from '@/lib/email/patterns/subscription-patterns';
+
+describe('EmailParser', () => {
+  let parser: EmailParser;
+
+  beforeEach(() => {
+    parser = new EmailParser();
+  });
+
+  describe('Netflix detection', () => {
+    test('should detect Netflix subscription payment', async () => {
+      const email = {
+        id: 'test-1',
+        subject: 'Netflix - お支払いのお知らせ',
+        sender: 'noreply@account.netflix.com',
+        receivedDate: new Date(),
+        body: `
+          いつもNetflixをご利用いただき、ありがとうございます。
+          
+          Netflix プレミアムプランの月額料金 ¥1,490 のお支払いが完了しました。
+          
+          次回のお支払い予定日: 2024年2月15日
+          
+          ご質問がある場合は、help.netflix.com をご確認ください。
+        `
+      };
+
+      const result = await parser.parseEmail(email);
+
+      expect(result.success).toBe(true);
+      expect(result.confidence).toBeGreaterThan(0.9);
+      expect(result.type).toBe('SUBSCRIPTION');
+      expect(result.data?.amount).toBe(1490);
+      expect(result.data?.currency).toBe('JPY');
+      expect(result.data?.serviceName).toBe('Netflix');
+      expect(result.matchedPattern).toBe('Netflix');
+    });
+  });
+
+  describe('Spotify detection', () => {
+    test('should detect Spotify subscription in USD', async () => {
+      const email = {
+        id: 'test-2',
+        subject: 'Your Spotify Premium subscription',
+        sender: 'noreply@spotify.com',
+        receivedDate: new Date(),
+        body: `
+          Thanks for using Spotify Premium!
+          
+          Your monthly subscription payment of $9.99 has been processed.
+          
+          Next billing date: February 15, 2024
+        `
+      };
+
+      const result = await parser.parseEmail(email);
+
+      expect(result.success).toBe(true);
+      expect(result.confidence).toBeGreaterThan(0.85);
+      expect(result.type).toBe('SUBSCRIPTION');
+      expect(result.data?.amount).toBe(9.99);
+      expect(result.data?.currency).toBe('USD');
+      expect(result.data?.serviceName).toBe('Spotify');
+    });
+  });
+
+  // パターン定義のテストケースを自動実行
+  describe('Pattern validation', () => {
+    SUBSCRIPTION_PATTERNS.forEach(pattern => {
+      pattern.testCases.forEach((testCase, index) => {
+        test(`${pattern.serviceName} test case ${index + 1}`, async () => {
+          const email = {
+            id: `test-${pattern.serviceName}-${index}`,
+            subject: testCase.email.subject,
+            sender: testCase.email.sender,
+            receivedDate: new Date(),
+            body: testCase.email.body
+          };
+
+          const result = await parser.parseEmail(email);
+
+          expect(result.success).toBe(true);
+          expect(result.data?.amount).toBe(testCase.expected.amount);
+          expect(result.data?.currency).toBe(testCase.expected.currency);
+          expect(result.data?.merchantName).toBe(testCase.expected.merchantName);
+        });
+      });
+    });
+  });
+
+  describe('Edge cases', () => {
+    test('should handle email with no amount', async () => {
+      const email = {
+        id: 'test-no-amount',
+        subject: 'Netflix - アカウント情報変更のお知らせ',
+        sender: 'noreply@account.netflix.com',
+        receivedDate: new Date(),
+        body: 'アカウント設定が変更されました。'
+      };
+
+      const result = await parser.parseEmail(email);
+
+      expect(result.success).toBe(false);
+      expect(result.errors.length).toBeGreaterThan(0);
+    });
+
+    test('should handle malformed amount formats', async () => {
+      const email = {
+        id: 'test-malformed',
+        subject: 'Test payment',
+        sender: 'test@example.com',
+        receivedDate: new Date(),
+        body: '金額: ¥1,abc,490円です'
+      };
+
+      const result = await parser.parseEmail(email);
+
+      // 汎用パーサーでフォールバック
+      expect(result.confidence).toBeLessThan(0.5);
+    });
+  });
+});
+```
+
+## Phase 3: 段階的処理・Vercel制限対応（推定1週間）
+
+### 3.1 バックグラウンドジョブ管理
+```typescript
+// lib/email/background-processor.ts
+interface ProcessingJob {
+  id: string;
+  userId: string;
+  status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'PARTIAL';
+  progress: number;
+  totalEmails: number;
+  processedEmails: number;
+  results: ParseResult[];
+  errors: string[];
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export class EmailBackgroundProcessor {
+  private readonly BATCH_SIZE = 20;
+  private readonly MAX_EXECUTION_TIME = 12000; // 12秒（余裕を持たせる）
+  
+  async processEmails(
+    emails: EmailMessage[], 
+    userId: string
+  ): Promise<ProcessingJob> {
+    const job: ProcessingJob = {
+      id: crypto.randomUUID(),
+      userId,
+      status: 'PENDING',
+      progress: 0,
+      totalEmails: emails.length,
+      processedEmails: 0,
+      results: [],
+      errors: [],
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    // ジョブをデータベースに保存
+    await this.saveJob(job);
+
+    // 段階的処理開始
+    await this.processBatch(job, emails, 0);
+
+    return job;
+  }
+
+  private async processBatch(
+    job: ProcessingJob, 
+    emails: EmailMessage[], 
+    startIndex: number
+  ): Promise<void> {
+    const startTime = Date.now();
+    const parser = new EmailParser();
+    
+    try {
+      job.status = 'RUNNING';
+      await this.updateJob(job);
+
+      const endIndex = Math.min(startIndex + this.BATCH_SIZE, emails.length);
+      const batch = emails.slice(startIndex, endIndex);
+
+      // バッチ処理
+      for (let i = 0; i < batch.length; i++) {
+        const email = batch[i];
+        
+        try {
+          const result = await parser.parseEmail(email);
+          job.results.push(result);
+          
+          if (result.success && result.confidence >= 0.7) {
+            // 高信頼度の結果をデータベースに保存
+            await this.saveSuccessfulResult(job.userId, email, result);
+          }
+          
+        } catch (error) {
+          job.errors.push(`Email ${email.id}: ${error.message}`);
+        }
+
+        job.processedEmails++;
+        job.progress = Math.round((job.processedEmails / job.totalEmails) * 100);
+
+        // 実行時間チェック
+        if (Date.now() - startTime > this.MAX_EXECUTION_TIME) {
+          // 次のバッチを新しいAPIコールで処理
+          await this.scheduleNextBatch(job.id, endIndex);
+          return;
+        }
+      }
+
+      // このバッチ完了
+      job.updatedAt = new Date();
+      await this.updateJob(job);
+
+      // まだ処理すべきメールがある場合
+      if (endIndex < emails.length) {
+        await this.scheduleNextBatch(job.id, endIndex);
+      } else {
+        // 全処理完了
+        job.status = 'COMPLETED';
+        job.progress = 100;
+        await this.updateJob(job);
+      }
+
+    } catch (error) {
+      job.status = 'FAILED';
+      job.errors.push(`Batch processing error: ${error.message}`);
+      await this.updateJob(job);
+    }
+  }
+
+  private async scheduleNextBatch(jobId: string, nextStartIndex: number): Promise<void> {
+    // Vercelの環境では即座に次の処理を呼び出し
+    // 本格運用時はキューシステム（Redis等）を使用
+    const response = await fetch('/api/email/process-batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jobId, startIndex: nextStartIndex })
+    });
+
+    if (!response.ok) {
+      console.error('Failed to schedule next batch:', response.statusText);
+    }
+  }
+
+  async getJobStatus(jobId: string): Promise<ProcessingJob | null> {
+    // データベースからジョブ取得
+    return await this.loadJob(jobId);
+  }
+
+  private async saveSuccessfulResult(
+    userId: string, 
+    email: EmailMessage, 
+    result: ParseResult
+  ): Promise<void> {
+    if (!result.success || !result.data) return;
+
+    // 取引またはサブスクリプションをデータベースに保存
+    if (result.type === 'SUBSCRIPTION') {
+      await this.saveDetectedSubscription(userId, email, result);
+    } else if (result.type === 'TRANSACTION') {
+      await this.saveDetectedTransaction(userId, email, result);
+    }
+  }
+
+  private async saveDetectedSubscription(
+    userId: string, 
+    email: EmailMessage, 
+    result: ParseResult
+  ): Promise<void> {
+    // 重複チェック
+    const existing = await prisma.subscription.findFirst({
+      where: {
+        userId,
+        serviceName: result.data!.serviceName,
+        amount: result.data!.amount
+      }
+    });
+
+    if (!existing) {
+      await prisma.subscription.create({
+        data: {
+          userId,
+          serviceName: result.data!.serviceName!,
+          amount: result.data!.amount,
+          currency: result.data!.currency,
+          billingCycle: result.data!.billingCycle as any,
+          detectionMethod: 'AUTO',
+          confidenceScore: result.confidence,
+          status: 'ACTIVE'
+        }
+      });
+    }
+  }
+
+  // データベース操作メソッド（実装詳細は省略）
+  private async saveJob(job: ProcessingJob): Promise<void> { /* ... */ }
+  private async updateJob(job: ProcessingJob): Promise<void> { /* ... */ }
+  private async loadJob(jobId: string): Promise<ProcessingJob | null> { /* ... */ }
+}
+```
+
+### 3.2 プログレス表示API
+```typescript
+// app/api/email/process-status/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { EmailBackgroundProcessor } from '@/lib/email/background-processor';
+
+export async function GET(req: NextRequest) {
+  try {
+    const { searchParams } = new URL(req.url);
+    const jobId = searchParams.get('jobId');
+    
+    if (!jobId) {
+      return NextResponse.json({ error: 'Job ID required' }, { status: 400 });
+    }
+
+    const processor = new EmailBackgroundProcessor();
+    const job = await processor.getJobStatus(jobId);
+
+    if (!job) {
+      return NextResponse.json({ error: 'Job not found' }, { status: 404 });
+    }
+
+    return NextResponse.json({
+      success: true,
+      data: {
+        jobId: job.id,
+        status: job.status,
+        progress: job.progress,
+        processedEmails: job.processedEmails,
+        totalEmails: job.totalEmails,
+        results: {
+          successfulDetections: job.results.filter(r => r.success && r.confidence >= 0.7).length,
+          subscriptionsFound: job.results.filter(r => r.type === 'SUBSCRIPTION' && r.success).length,
+          transactionsFound: job.results.filter(r => r.type === 'TRANSACTION' && r.success).length
+        },
+        errors: job.errors,
+        estimatedTimeRemaining: job.status === 'RUNNING' ? 
+          this.calculateEstimatedTime(job) : 0
+      }
+    });
+
+  } catch (error) {
+    return NextResponse.json({
+      success: false,
+      error: error.message
+    }, { status: 500 });
+  }
+}
+
+function calculateEstimatedTime(job: ProcessingJob): number {
+  if (job.progress === 0) return 0;
+  
+  const elapsed = Date.now() - job.createdAt.getTime();
+  const remainingProgress = 100 - job.progress;
+  
+  return Math.round((elapsed / job.progress) * remainingProgress / 1000); // 秒
+}
+```
+
+## 完了条件・検証項目
+
+### 技術検証成功基準
+- [ ] Gmail OAuth認証・トークン管理動作確認
+- [ ] 100件のメール取得が30秒以内で完了
+- [ ] Netflix、Spotify、楽天カードの検知精度90%以上
+- [ ] 15秒制限内での段階的処理動作確認
+- [ ] プログレスバーのリアルタイム更新動作
+
+### テストケース完了基準
+- [ ] 主要サービス20個の検知テスト全てパス
+- [ ] エラーケース（金額なし、不正フォーマット）の適切な処理
+- [ ] 外貨（USD）サブスクの正確な検知・換算
+- [ ] 複数メールアカウント対応動作確認
+
+### パフォーマンス検証
+```typescript
+// __tests__/performance/email-processing.test.ts
+describe('Performance Tests', () => {
+  test('should process 100 emails under 30 seconds', async () => {
+    const startTime = Date.now();
+    const emails = generateTestEmails(100);
+    const processor = new EmailBackgroundProcessor();
+    
+    const job = await processor.processEmails(emails, 'test-user');
+    
+    // ジョブ完了まで待機
+    await waitForJobCompletion(job.id, 60000); // 60秒タイムアウト
+    
+    const endTime = Date.now();
+    expect(endTime - startTime).toBeLessThan(30000); // 30秒以内
+  });
+
+  test('should handle Vercel 15-second limit', async () => {
+    const emails = generateTestEmails(50);
+    const processor = new EmailBackgroundProcessor();
+    
+    const job = await processor.processEmails(emails, 'test-user');
+    
+    // 段階的処理が正常に動作することを確認
+    expect(job.status).toMatch(/RUNNING|COMPLETED|PARTIAL/);
+  });
+});
+```
+
+---
+
+## 🎨 設計書詳細化
+
+次に、実装精度を高めるため設計書を詳細化します：
+
+### 詳細化項目
+
+1. **ワイヤーフレーム・UI詳細設計**
+2. **エラーハンドリング具体ケース**  
+3. **セキュリティ対策実装詳細**
+4. **パフォーマンス最適化戦略**
+5. **運用監視項目詳細**
+
+どの項目から詳細化しますか？
+
+**推奨順序:**
+1. **ワイヤーフレーム** → UI実装の具体的指針
+2. **エラーハンドリング** → 堅牢性確保  
+3. **セキュリティ** → 信頼性向上
+4. **パフォーマンス** → ユーザー体験向上
+5. **運用監視** → 長期運用準備
+
+または、**メール解析エンジンの実装を先に開始**して技術検証を進めることも可能です。
+
+どちらを優先しますか？

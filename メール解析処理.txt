@@ -1,0 +1,408 @@
+# メール解析処理仕様書
+
+## 1. 処理フロー概要
+
+```
+1. メール取得 → 2. フィルタリング → 3. パターンマッチング → 4. データ抽出 → 5. 検証 → 6. 保存
+```
+
+## 2. 詳細処理フロー
+
+### 2.1 メール取得フェーズ
+```typescript
+// Gmail API / Yahoo Mail API から取得
+async function fetchEmails(emailAccount: EmailAccount, dateRange: DateRange) {
+  const query = buildSearchQuery(dateRange);
+  const messages = await getMessagesFromAPI(emailAccount, query);
+  return messages;
+}
+
+// 検索クエリ例
+// Gmail: "from:(noreply@account.netflix.com OR account-update@amazon.co.jp) after:2024-06-01"
+```
+
+**取得対象の絞り込み**
+- 期間: ユーザープランに応じて（無料版なし、有料版3ヶ月、Pro版1年）
+- 差出人: 既知のクレカ会社・サービスプロバイダーのみ
+- 件名フィルター: 「お支払い」「利用」「Payment」等のキーワード
+
+### 2.2 フィルタリングフェーズ
+```typescript
+function filterCreditCardEmails(messages: EmailMessage[]) {
+  const patterns = [
+    // クレカ会社パターン
+    /rakuten-card\.co\.jp/,
+    /vpass\.ne\.jp/, // 三井住友
+    /jcb\.co\.jp/,
+    /aeon\.co\.jp/,
+    
+    // サービスパターン  
+    /netflix\.com/,
+    /spotify\.com/,
+    /amazon\.(co\.jp|com)/,
+    /adobe\.com/
+  ];
+  
+  return messages.filter(message => 
+    patterns.some(pattern => pattern.test(message.sender))
+  );
+}
+```
+
+### 2.3 パターンマッチング・データ抽出フェーズ
+```typescript
+interface ExtractionResult {
+  amount: number | null;
+  currency: string;
+  merchantName: string | null;
+  serviceType: 'CREDIT_CARD' | 'SUBSCRIPTION' | 'UNKNOWN';
+  confidence: number; // 0.0 - 1.0
+  errors: string[];
+}
+
+async function extractDataFromEmail(email: EmailMessage): Promise<ExtractionResult> {
+  const patterns = await getSubscriptionPatterns();
+  let bestMatch: ExtractionResult | null = null;
+  
+  for (const pattern of patterns) {
+    const match = tryExtractWithPattern(email, pattern);
+    if (match && match.confidence > (bestMatch?.confidence || 0)) {
+      bestMatch = match;
+    }
+  }
+  
+  // パターンマッチしない場合は汎用抽出を試行
+  if (!bestMatch || bestMatch.confidence < 0.7) {
+    bestMatch = fallbackExtraction(email);
+  }
+  
+  return bestMatch || createErrorResult(email);
+}
+```
+
+## 3. データ抽出パターン
+
+### 3.1 サブスクリプションパターン
+```typescript
+const SUBSCRIPTION_PATTERNS = [
+  {
+    serviceName: 'Netflix',
+    senderPattern: /noreply@account\.netflix\.com/,
+    subjectPattern: /お支払いのお知らせ|Payment confirmation/,
+    amountPatterns: [
+      /¥([0-9,]+)/,           // ¥1,490
+      /JPY\s*([0-9,]+)/,      // JPY 1,490
+      /([0-9,]+)円/           // 1,490円
+    ],
+    merchantName: 'Netflix',
+    billingCycle: 'MONTHLY',
+    confidence: 0.95
+  },
+  
+  {
+    serviceName: 'Spotify',
+    senderPattern: /noreply@spotify\.com/,
+    subjectPattern: /Premium|お支払い|Payment/,
+    amountPatterns: [
+      /\$([0-9.]+)/,          // $9.99
+      /¥([0-9,]+)/,           // ¥980
+      /USD\s*([0-9.]+)/       // USD 9.99
+    ],
+    merchantName: 'Spotify',
+    billingCycle: 'MONTHLY',
+    confidence: 0.90
+  }
+];
+```
+
+### 3.2 クレジットカード利用通知パターン
+```typescript
+const CREDIT_CARD_PATTERNS = [
+  {
+    issuer: '楽天カード',
+    senderPattern: /rakuten-card\.co\.jp/,
+    subjectPattern: /カード利用のお知らせ|ご利用確認/,
+    amountPatterns: [
+      /利用金額[：:]\s*¥?([0-9,]+)/,
+      /ご利用金額[：:]\s*¥?([0-9,]+)/
+    ],
+    merchantPatterns: [
+      /ご利用店舗[：:]\s*(.+?)(?:\n|$)/,
+      /利用先[：:]\s*(.+?)(?:\n|$)/
+    ],
+    confidence: 0.85
+  }
+];
+```
+
+### 3.3 汎用抽出パターン（フォールバック）
+```typescript
+function fallbackExtraction(email: EmailMessage): ExtractionResult {
+  const content = email.subject + '\n' + email.body;
+  
+  // 金額抽出（複数パターンを試行）
+  const amountPatterns = [
+    /¥([0-9,]+)/g,
+    /([0-9,]+)円/g,
+    /\$([0-9.]+)/g,
+    /JPY\s*([0-9,]+)/g,
+    /USD\s*([0-9.]+)/g
+  ];
+  
+  // 店舗名抽出
+  const merchantPatterns = [
+    /店舗[：:]\s*(.+?)(?:\n|$)/,
+    /利用先[：:]\s*(.+?)(?:\n|$)/,
+    /Merchant[：:]\s*(.+?)(?:\n|$)/i
+  ];
+  
+  return {
+    amount: extractAmount(content, amountPatterns),
+    currency: extractCurrency(content),
+    merchantName: extractMerchant(content, merchantPatterns),
+    serviceType: 'UNKNOWN',
+    confidence: 0.5, // 低信頼度
+    errors: []
+  };
+}
+```
+
+## 4. エラーハンドリング戦略
+
+### 4.1 エラー分類
+```typescript
+enum EmailProcessingError {
+  // 取得エラー
+  API_RATE_LIMIT = 'API_RATE_LIMIT',
+  AUTHENTICATION_FAILED = 'AUTHENTICATION_FAILED',
+  NETWORK_TIMEOUT = 'NETWORK_TIMEOUT',
+  
+  // 解析エラー
+  AMOUNT_EXTRACTION_FAILED = 'AMOUNT_EXTRACTION_FAILED',
+  MERCHANT_PARSING_FAILED = 'MERCHANT_PARSING_FAILED',
+  UNKNOWN_EMAIL_FORMAT = 'UNKNOWN_EMAIL_FORMAT',
+  MULTIPLE_AMOUNTS_FOUND = 'MULTIPLE_AMOUNTS_FOUND',
+  
+  // データエラー
+  INVALID_AMOUNT_FORMAT = 'INVALID_AMOUNT_FORMAT',
+  UNSUPPORTED_CURRENCY = 'UNSUPPORTED_CURRENCY',
+  DATABASE_SAVE_FAILED = 'DATABASE_SAVE_FAILED'
+}
+```
+
+### 4.2 エラー処理方針
+```typescript
+class EmailProcessingService {
+  async processEmailBatch(emails: EmailMessage[]): Promise<ProcessingResult> {
+    const results = [];
+    const errors = [];
+    
+    for (const email of emails) {
+      try {
+        const result = await this.processEmail(email);
+        if (result.confidence >= 0.7) {
+          // 高信頼度: 自動保存
+          await this.saveTransaction(result);
+          results.push(result);
+        } else if (result.confidence >= 0.4) {
+          // 中信頼度: ユーザー確認待ち
+          await this.savePendingTransaction(result);
+        } else {
+          // 低信頼度: エラーログのみ
+          errors.push(result);
+        }
+      } catch (error) {
+        await this.logProcessingError(email, error);
+        errors.push({ email: email.id, error: error.message });
+      }
+    }
+    
+    return { results, errors };
+  }
+}
+```
+
+### 4.3 リトライ戦略
+```typescript
+async function processEmailWithRetry(email: EmailMessage, maxRetries = 3) {
+  let lastError: Error;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await extractDataFromEmail(email);
+    } catch (error) {
+      lastError = error;
+      
+      if (isRetryableError(error)) {
+        const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
+        await sleep(delay);
+        continue;
+      } else {
+        // リトライ不可能なエラー（フォーマットエラー等）
+        throw error;
+      }
+    }
+  }
+  
+  throw lastError;
+}
+
+function isRetryableError(error: Error): boolean {
+  return [
+    'NETWORK_TIMEOUT',
+    'API_RATE_LIMIT',
+    'DATABASE_CONNECTION_FAILED'
+  ].includes(error.code);
+}
+```
+
+## 5. バックグラウンド処理設計
+
+### 5.1 キューシステム
+```typescript
+// Vercel環境での制約を考慮した設計
+interface EmailProcessingJob {
+  id: string;
+  userId: string;
+  emailAccountId: string;
+  dateRange: { start: Date; end: Date };
+  status: 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED';
+  progress: number; // 0-100
+  createdAt: Date;
+  processedAt?: Date;
+}
+
+// 段階的処理（Vercelの15秒制限対応）
+async function processEmailsInBatches(job: EmailProcessingJob) {
+  const BATCH_SIZE = 20; // 1回の処理で20件ずつ
+  const emails = await fetchEmails(job.emailAccountId, job.dateRange);
+  
+  let processed = 0;
+  for (let i = 0; i < emails.length; i += BATCH_SIZE) {
+    const batch = emails.slice(i, i + BATCH_SIZE);
+    await processEmailBatch(batch);
+    
+    processed += batch.length;
+    await updateJobProgress(job.id, (processed / emails.length) * 100);
+    
+    // 次のバッチは新しいAPIコールで処理
+    if (i + BATCH_SIZE < emails.length) {
+      await scheduleNextBatch(job.id, i + BATCH_SIZE);
+      return;
+    }
+  }
+  
+  await completeJob(job.id);
+}
+```
+
+### 5.2 プログレス表示
+```typescript
+interface ProcessingProgress {
+  jobId: string;
+  status: string;
+  progress: number;
+  currentStep: string;
+  emailsProcessed: number;
+  emailsTotal: number;
+  transactionsFound: number;
+  subscriptionsFound: number;
+  errors: number;
+  estimatedTimeRemaining: number; // seconds
+}
+
+// フロントエンドへのリアルタイム更新
+async function getProcessingProgress(userId: string): Promise<ProcessingProgress> {
+  const job = await getActiveJob(userId);
+  return {
+    jobId: job.id,
+    status: job.status,
+    progress: job.progress,
+    currentStep: getCurrentStep(job),
+    ...await getJobStats(job.id)
+  };
+}
+```
+
+## 6. テスト・デバッグ戦略
+
+### 6.1 テストデータセット
+```typescript
+const TEST_EMAILS = [
+  {
+    service: 'Netflix',
+    subject: 'Netflix - お支払いのお知らせ',
+    sender: 'noreply@account.netflix.com',
+    body: 'Netflix プレミアムプランのお支払いが完了しました。金額: ¥1,490',
+    expected: {
+      amount: 1490,
+      currency: 'JPY',
+      merchantName: 'Netflix',
+      confidence: 0.95
+    }
+  },
+  // エラーケース
+  {
+    service: 'Unknown',
+    subject: '謎のメール',
+    sender: 'unknown@example.com',
+    body: '金額が書かれていないメール',
+    expected: {
+      amount: null,
+      confidence: 0.0,
+      errors: ['AMOUNT_EXTRACTION_FAILED']
+    }
+  }
+];
+```
+
+### 6.2 精度測定
+```typescript
+async function measureExtractionAccuracy() {
+  const testResults = [];
+  
+  for (const testEmail of TEST_EMAILS) {
+    const result = await extractDataFromEmail(testEmail);
+    const accuracy = calculateAccuracy(result, testEmail.expected);
+    testResults.push({ testEmail, result, accuracy });
+  }
+  
+  const overallAccuracy = testResults.reduce((sum, t) => sum + t.accuracy, 0) / testResults.length;
+  
+  return {
+    overallAccuracy,
+    detailedResults: testResults,
+    recommendations: generateImprovements(testResults)
+  };
+}
+```
+
+## 7. 運用・監視
+
+### 7.1 メトリクス収集
+```typescript
+interface ProcessingMetrics {
+  totalEmailsProcessed: number;
+  successfulExtractions: number;
+  failedExtractions: number;
+  averageConfidenceScore: number;
+  processingTimeMs: number;
+  errorsByType: Record<string, number>;
+}
+
+// 日次レポート
+async function generateDailyReport(): Promise<ProcessingMetrics> {
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  
+  return await calculateMetrics(yesterday);
+}
+```
+
+### 7.2 アラート設定
+- 解析エラー率が20%を超えた場合
+- API制限に到達した場合
+- 新しい未対応メールパターンが大量検出された場合
+
+---
+

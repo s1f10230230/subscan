@@ -1,0 +1,728 @@
+# 画面・コンポーネント設計書
+
+## 1. 設計思想・UXの基本方針
+
+### 1.1 デザインシステムの基本理念
+マネーフォワードやZaimの調査から、家計簿アプリで重要なのは「直感的で一覧性が高い」「タップ数を最小限に抑制」「継続使用を促進する楽しさ」であることが分かりました。
+
+**核となる設計思想:**
+- **Minimal Cognitive Load**: 情報の優先順位を明確にし、認知負荷を最小限に
+- **Progressive Disclosure**: 段階的に情報を開示し、初心者から上級者まで対応
+- **Delight-First**: WOW体験を最優先に、機能的価値と感情的価値を両立
+
+### 1.2 競合分析から得られた知見
+| アプリ | 強み | 弱み | 我々の対応 |
+|--------|------|------|-----------|
+| マネーフォワード ME | 情報密度高、多機能 | UIが複雑化、改悪リニューアル事例 | シンプルさと機能性のバランス |
+| Zaim | 直感的操作、95.4%が継続しやすい | 有料版への誘導が目立つ | 価値実感後の自然な課金誘導 |
+| 我々の差別化 | **サブスク検知 + 自動メール解析** | - | 独自価値で一気に引き込む |
+
+## 2. ディレクトリ構造・ファイル構成
+
+```
+src/
+├── app/                     # Next.js 14 App Router
+│   ├── (auth)/              # 認証グループ
+│   │   ├── login/
+│   │   └── signup/
+│   ├── (marketing)/         # マーケティング・LP
+│   │   ├── page.tsx         # ランディングページ
+│   │   ├── pricing/
+│   │   └── about/
+│   ├── (dashboard)/         # メインアプリ（認証後）
+│   │   ├── layout.tsx       # 共通レイアウト
+│   │   ├── page.tsx         # ダッシュボード
+│   │   ├── transactions/    # 家計簿管理
+│   │   ├── subscriptions/   # サブスク管理
+│   │   ├── cards/          # カード管理
+│   │   │   ├── page.tsx    # カード一覧
+│   │   │   └── [id]/       # カード別利用状況詳細
+│   │   ├── settings/       # 設定
+│   │   │   └── email-logs/ # メール解析ログ確認
+│   │   └── onboarding/     # 初回セットアップ
+│   ├── api/                # API Routes
+│   └── globals.css         # グローバルスタイル
+├── components/             # 再利用コンポーネント
+│   ├── ui/                # shadcn/ui ベース UI コンポーネント
+│   │   ├── Button.tsx
+│   │   ├── Card.tsx
+│   │   ├── Dialog.tsx
+│   │   ├── Input.tsx
+│   │   └── Toast.tsx
+│   ├── layout/            # レイアウト関連
+│   │   ├── Header.tsx
+│   │   ├── Sidebar.tsx
+│   │   ├── Navigation.tsx
+│   │   └── Footer.tsx
+│   ├── auth/              # 認証関連
+│   │   ├── LoginForm.tsx
+│   │   └── SocialLogin.tsx
+│   ├── dashboard/         # ダッシュボード関連
+│   │   ├── StatsCard.tsx
+│   │   ├── ExpenseChart.tsx
+│   │   ├── RecentTransactions.tsx
+│   │   └── SubscriptionAlert.tsx
+│   ├── transactions/      # 取引関連
+│   │   ├── TransactionList.tsx
+│   │   ├── TransactionForm.tsx
+│   │   ├── TransactionCard.tsx
+│   │   └── CategorySelector.tsx
+│   ├── subscriptions/     # サブスク関連
+│   │   ├── SubscriptionList.tsx
+│   │   ├── SubscriptionCard.tsx
+│   │   ├── DetectedAlert.tsx
+│   │   └── SavingsCalculator.tsx
+│   ├── onboarding/        # オンボーディング
+│   │   ├── WelcomeScreen.tsx
+│   │   ├── EmailConnection.tsx
+│   │   ├── AnalysisProgress.tsx
+│   │   ├── ResultsScreen.tsx
+│   │   └── PlanSelection.tsx
+│   └── common/            # 共通コンポーネント
+│       ├── LoadingSpinner.tsx
+│       ├── EmptyState.tsx
+│       ├── ErrorBoundary.tsx
+│       └── ConfirmDialog.tsx
+├── hooks/                 # カスタムフック
+│   ├── useAuth.ts
+│   ├── useEmailSync.ts
+│   ├── useTransactions.ts
+│   └── useSubscriptions.ts
+├── lib/                  # ユーティリティ
+│   ├── auth.ts           # NextAuth設定
+│   ├── db.ts             # Prisma client
+│   ├── email/            # メール解析
+│   │   ├── gmail.ts
+│   │   ├── patterns.ts
+│   │   └── parser.ts
+│   ├── utils.ts          # 汎用ユーティリティ
+│   └── validations.ts    # Zod バリデーション
+├── styles/               # スタイル
+│   ├── globals.css
+│   └── components.css
+└── types/                # 型定義
+    ├── auth.ts
+    ├── transaction.ts
+    ├── subscription.ts
+    └── email.ts
+```
+
+## 3. 共通UIコンポーネント設計
+
+### 3.1 デザイントークン（Design Tokens）
+```typescript
+// styles/tokens.ts
+export const tokens = {
+  colors: {
+    // プライマリカラー（信頼感のあるブルー系）
+    primary: {
+      50: '#eff6ff',
+      500: '#3b82f6',
+      600: '#2563eb',
+      900: '#1e3a8a',
+    },
+    // セカンダリ（アクションを促すオレンジ系）
+    secondary: {
+      50: '#fff7ed',
+      500: '#f97316',
+      600: '#ea580c',
+    },
+    // 成功・収入（グリーン）
+    success: {
+      50: '#f0fdf4',
+      500: '#22c55e',
+      600: '#16a34a',
+    },
+    // 警告・支出（レッド）
+    danger: {
+      50: '#fef2f2',
+      500: '#ef4444',
+      600: '#dc2626',
+    },
+    // ニュートラル
+    gray: {
+      50: '#f9fafb',
+      100: '#f3f4f6',
+      500: '#6b7280',
+      800: '#1f2937',
+      900: '#111827',
+    }
+  },
+  
+  typography: {
+    fontFamily: {
+      sans: ['Inter', 'Noto Sans JP', 'sans-serif'],
+      mono: ['JetBrains Mono', 'monospace'],
+    },
+    fontSize: {
+      xs: ['12px', '16px'],
+      sm: ['14px', '20px'],
+      base: ['16px', '24px'],
+      lg: ['18px', '28px'],
+      xl: ['20px', '28px'],
+      '2xl': ['24px', '32px'],
+      '3xl': ['30px', '36px'],
+    }
+  },
+  
+  spacing: {
+    1: '4px',
+    2: '8px',
+    3: '12px',
+    4: '16px',
+    5: '20px',
+    6: '24px',
+    8: '32px',
+    10: '40px',
+    12: '48px',
+    16: '64px',
+  },
+  
+  borderRadius: {
+    sm: '4px',
+    md: '8px',
+    lg: '12px',
+    xl: '16px',
+    full: '9999px',
+  },
+  
+  shadows: {
+    sm: '0 1px 3px 0 rgb(0 0 0 / 0.1)',
+    md: '0 4px 6px -1px rgb(0 0 0 / 0.1)',
+    lg: '0 10px 15px -3px rgb(0 0 0 / 0.1)',
+    xl: '0 20px 25px -5px rgb(0 0 0 / 0.1)',
+  }
+};
+```
+
+### 3.2 共通コンポーネント仕様
+```typescript
+// components/ui/Card.tsx
+interface CardProps extends React.HTMLAttributes<HTMLDivElement> {
+  variant?: 'default' | 'outlined' | 'elevated';
+  size?: 'sm' | 'md' | 'lg';
+  clickable?: boolean;
+  loading?: boolean;
+}
+
+// components/ui/Button.tsx
+interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
+  variant?: 'primary' | 'secondary' | 'outline' | 'ghost' | 'danger';
+  size?: 'xs' | 'sm' | 'md' | 'lg' | 'xl';
+  loading?: boolean;
+  leftIcon?: React.ReactNode;
+  rightIcon?: React.ReactNode;
+}
+
+// components/dashboard/StatsCard.tsx
+interface StatsCardProps {
+  title: string;
+  value: string | number;
+  change?: {
+    value: number;
+    percentage: number;
+    period: string;
+  };
+  icon?: React.ReactNode;
+  trend?: 'up' | 'down' | 'neutral';
+  loading?: boolean;
+  onClick?: () => void;
+}
+```
+
+## 4. 主要画面設計
+
+### 4.1 ランディングページ（Marketing Site）
+
+**レイアウト構成:**
+```
+[Header: Logo + Login/Signup]
+[Hero Section: メインメッセージ + CTA]
+[Problem Section: 現状の課題提起]
+[Solution Section: 解決策・機能紹介]
+[Social Proof: 利用者数・効果実績]
+[Pricing: 料金プラン比較]
+[FAQ: よくある質問]
+[Footer: 会社情報・リンク]
+```
+
+**ヒーローセクション設計:**
+```typescript
+interface HeroSectionProps {
+  mainHeadline: string;        // "複数クレカを一元管理"
+  subHeadline: string;         // "解約し忘れたサブスクを発見"
+  valueProposition: string;    // "手入力から解放"
+  ctaButton: {
+    text: string;              // "無料で始める"
+    variant: 'primary';
+    size: 'xl';
+  };
+  visualDemo?: React.ReactNode; // アプリのデモ動画/スクリーンショット
+}
+```
+
+### 4.2 オンボーディング画面群
+
+**画面フロー（パターンC: 即価値提供型）:**
+```
+1. Welcome → 2. Gmail連携 → 3. 分析実行 → 4. WOW結果表示 → 5. プラン選択
+```
+
+#### 4.2.1 Welcome Screen
+```typescript
+interface WelcomeScreenProps {
+  title: "過去3ヶ月のメールから、隠れた支出とサブスクを分析してみませんか？";
+  subtitle: "（3分で完了）";
+  benefits: string[];  // ["自動でクレカ利用を検出", "サブスクを自動発見", "年間◯万円の節約可能額を表示"]
+  ctaButton: {
+    text: "Gmailで始める";
+    icon: <GmailIcon />;
+  };
+  securityNote: "メール内容は読まず、件名と差出人のみ取得します";
+}
+```
+
+#### 4.2.2 Email Connection Screen
+```typescript
+interface EmailConnectionProps {
+  step: number;           // 現在のステップ（2/5）
+  provider: 'gmail';      // 対応プロバイダー
+  permissions: {
+    description: string;  // "過去3ヶ月のクレカ通知メールのみ取得"
+    scopes: string[];     // ["件名の読み取り", "差出人の確認", "受信日の取得"]
+  };
+  securityInfo: {
+    encryption: boolean;
+    dataRetention: string; // "有料プラン: 3ヶ月間保持"
+  };
+  onConnect: () => Promise<void>;
+  onSkip: () => void;     // 後でも設定可能
+}
+```
+
+#### 4.2.3 Analysis Progress Screen
+```typescript
+interface AnalysisProgressProps {
+  progress: number;         // 0-100
+  currentStep: string;      // "主要サービス検索中..." → "詳細分析中..." → "サブスク検知中..."
+  stats: {
+    emailsScanned: number;
+    transactionsFound: number;
+    subscriptionsDetected: number;
+  };
+  estimatedTime: number;    // 残り秒数
+  targetProviders: string[]; // "楽天カード、Netflix、Spotifyをチェック中..."
+  animations: {
+    scanningEffect: boolean;
+    progressPulse: boolean;
+    providerHighlight: boolean; // 現在処理中のプロバイダーをハイライト
+  };
+}
+```
+
+#### 4.2.4 Results Screen (WOW体験)
+```typescript
+interface ResultsScreenProps {
+  summary: {
+    totalTransactions: number;
+    totalAmount: number;
+    subscriptionsFound: number;
+    potentialSavings: number;    // 年間節約可能額
+  };
+  detectedSubscriptions: {
+    id: string;
+    serviceName: string;
+    amount: number;
+    billingCycle: 'monthly' | 'yearly';
+    confidence: number;          // 0-1
+    lastUsed?: Date;            // 最終利用日（推測）
+  }[];
+  surpriseElements: {
+    hiddenExpenses: number;      // "隠れた支出"
+    forgottenSubscriptions: number;
+  };
+  ctaButtons: {
+    primary: "詳しく見る";
+    secondary: "有料版で継続監視";
+  };
+}
+```
+
+### 4.3 ダッシュボード画面
+
+**レイアウト構成（モバイルファースト）:**
+```
+[Header: ユーザー情報 + 通知 + プラン]
+[Quick Stats: 4つの主要指標]
+[Chart Section: 月間支出トレンド]
+[Subscription Alerts: 要注意サブスク]
+[Recent Transactions: 最新取引5件]
+[Action Cards: よく使う機能への導線]
+```
+
+```typescript
+interface DashboardProps {
+  user: User;
+  stats: {
+    monthlyTotal: number;
+    activeSubscriptions: number;
+    potentialSavings: number;
+    transactionCount: number;
+  };
+  chartData: {
+    labels: string[];           // ['1月', '2月', '3月']
+    datasets: {
+      income: number[];
+      expenses: number[];
+      subscriptions: number[];
+    };
+  };
+  alerts: SubscriptionAlert[];  // 要注意サブスク
+  recentTransactions: Transaction[];
+  quickActions: QuickAction[];
+}
+
+interface SubscriptionAlert {
+  id: string;
+  type: 'unused' | 'expensive' | 'duplicate';
+  serviceName: string;
+  message: string;
+  severity: 'low' | 'medium' | 'high';
+  action: string;               // "解約を検討", "プラン変更を検討"
+}
+```
+
+### 4.4 家計簿（Transactions）画面
+
+**タブ構成（Zaimのベストプラクティス参考）:**
+```
+[Timeline] [Categories] [Search] [Calendar]
+```
+
+#### 4.4.1 Timeline View
+```typescript
+interface TransactionTimelineProps {
+  transactions: Transaction[];
+  groupBy: 'day' | 'week' | 'month';
+  filters: {
+    dateRange: [Date, Date];
+    categories: string[];
+    creditCards: string[];
+    amountRange: [number, number];
+  };
+  sortBy: 'date' | 'amount';
+  sortOrder: 'asc' | 'desc';
+  onFilter: (filters: Filters) => void;
+  onSort: (sortBy: string, order: string) => void;
+}
+
+interface TransactionCard {
+  id: string;
+  date: Date;
+  merchant: string;
+  amount: number;
+  category: Category;
+  creditCard: CreditCard;
+  source: 'email' | 'manual';
+  verified: boolean;           // ユーザー確認済み
+  description?: string;
+  onEdit: () => void;
+  onDelete: () => void;
+  onVerify: () => void;        // 自動取得データの確認
+}
+```
+
+#### 4.4.2 Categories View
+```typescript
+interface CategoriesViewProps {
+  categories: {
+    id: string;
+    name: string;
+    icon: string;
+    totalAmount: number;
+    transactionCount: number;
+    percentage: number;          // 全支出に占める割合
+    trend: 'up' | 'down' | 'neutral';
+    budget?: number;            // 予算設定
+    budgetUsed?: number;        // 予算使用率
+  }[];
+  period: 'week' | 'month' | 'year';
+  onCategoryClick: (categoryId: string) => void;
+}
+```
+
+### 4.5 サブスクリプション管理画面
+
+**レイアウト構成:**
+```
+[Summary Cards: 総額・件数・節約可能額]
+[Detection Status: 自動検知状況]
+[Subscription List: サブスク一覧]
+[Manual Add: 手動追加]
+```
+
+```typescript
+interface SubscriptionManagementProps {
+  summary: {
+    totalMonthly: number;
+    totalYearly: number;
+    activeCount: number;
+    potentialSavings: number;
+  };
+  detectionStatus: {
+    lastScan: Date;
+    emailsScanned: number;
+    newFound: number;
+    confidence: 'high' | 'medium' | 'low';
+  };
+  subscriptions: SubscriptionCardData[];
+  onRescan: () => Promise<void>;
+  onManualAdd: () => void;
+}
+
+interface SubscriptionCardData {
+  id: string;
+  serviceName: string;
+  planName?: string;
+  amount: number;
+  currency: 'JPY' | 'USD';
+  billingCycle: 'monthly' | 'yearly';
+  nextBilling?: Date;
+  detectionMethod: 'auto' | 'manual';
+  // confidence項目を削除（非表示）
+  usage: {
+    lastUsed?: Date;
+    frequency: 'high' | 'medium' | 'low' | 'unknown';
+    userMemo?: string;
+  };
+  learningStatus?: {
+    improving: boolean;      // 機械学習で精度向上中
+    message: string;         // "パターン学習中..."
+  };
+  actions: {
+    edit: () => void;
+    delete: () => void;
+    markAsUsed: () => void;
+    addMemo: () => void;
+  };
+}
+```
+
+### 4.7 カード別利用状況詳細画面
+
+**レイアウト構成:**
+```
+[Card Header: カード情報・総額]
+[Period Selector: 期間選択]
+[Usage Chart: 月次利用推移]
+[Category Breakdown: カテゴリ別内訳]
+[Transaction List: 取引履歴]
+[Insights: 利用パターン分析]
+```
+
+```typescript
+interface CardDetailProps {
+  card: CreditCard;
+  period: 'month' | 'quarter' | 'year';
+  summary: {
+    totalAmount: number;
+    transactionCount: number;
+    averagePerTransaction: number;
+    monthlyAverage: number;
+  };
+  chartData: {
+    monthly: { month: string; amount: number }[];
+    categories: { name: string; amount: number; percentage: number }[];
+  };
+  transactions: Transaction[];
+  insights: {
+    topMerchant: string;
+    peakMonth: string;
+    unusualSpending?: {
+      date: Date;
+      amount: number;
+      reason: string;
+    };
+  };
+  onPeriodChange: (period: string) => void;
+}
+```
+
+### 4.8 メール解析ログ確認画面
+
+**レイアウト構成:**
+```
+[Sync Status: 最終同期・次回同期]
+[Processing Stats: 成功・失敗・精度]
+[Log Timeline: 処理履歴]
+[Error Details: エラー詳細]
+[Manual Actions: 手動再処理]
+```
+
+```typescript
+interface EmailLogsProps {
+  syncStatus: {
+    lastSync: Date;
+    nextSync: Date;
+    isRunning: boolean;
+    emailAccount: EmailAccount;
+  };
+  stats: {
+    totalProcessed: number;
+    successful: number;
+    failed: number;
+    accuracy: number;        // 精度（ユーザー修正率から算出）
+    improvementRate: number; // 改善率
+  };
+  logs: ProcessingLog[];
+  errors: ProcessingError[];
+  onManualSync: () => Promise<void>;
+  onRetryFailed: () => Promise<void>;
+  onViewErrorDetail: (errorId: string) => void;
+}
+
+interface ProcessingLog {
+  id: string;
+  timestamp: Date;
+  emailCount: number;
+  transactionsFound: number;
+  subscriptionsFound: number;
+  processingTime: number;   // 処理時間（ms）
+  status: 'success' | 'partial' | 'failed';
+  details?: string;
+}
+
+interface ProcessingError {
+  id: string;
+  timestamp: Date;
+  errorType: string;        // "AMOUNT_EXTRACTION_FAILED"
+  emailSubject: string;     // デバッグ用（一部マスキング）
+  emailSender: string;
+  errorMessage: string;
+  canRetry: boolean;
+}
+```
+
+**セクション構成:**
+```
+[Profile] [Email Accounts] [Credit Cards] [Plan & Billing] [Privacy] [Support]
+```
+
+```typescript
+interface SettingsProps {
+  user: User;
+  emailAccounts: EmailAccount[];
+  creditCards: CreditCard[];
+  currentPlan: 'free' | 'standard' | 'pro';
+  preferences: {
+    monthStartDay: number;
+    currency: string;
+    timezone: string;
+    notifications: NotificationSettings;
+  };
+  onUpdateProfile: (data: ProfileData) => Promise<void>;
+  onConnectEmail: (provider: string) => Promise<void>;
+  onDisconnectEmail: (accountId: string) => Promise<void>;
+  onUpgradePlan: () => void;
+}
+
+interface EmailAccountCard {
+  id: string;
+  email: string;
+  provider: 'gmail' | 'yahoo';
+  status: 'connected' | 'error' | 'syncing';
+  lastSync: Date;
+  syncedEmails: number;
+  onReconnect: () => Promise<void>;
+  onDisconnect: () => Promise<void>;
+  onViewLogs: () => void;
+}
+```
+
+## 5. モバイル対応・レスポンシブ設計
+
+### 5.1 ブレークポイント
+```typescript
+const breakpoints = {
+  sm: '640px',    // モバイル
+  md: '768px',    // タブレット縦
+  lg: '1024px',   // タブレット横・小型PC
+  xl: '1280px',   // デスクトップ
+  '2xl': '1536px' // 大型デスクトップ
+};
+```
+
+### 5.2 モバイル最適化
+- **タッチターゲット**: 最小44px（Apple HIG準拠）
+- **片手操作**: 重要なアクションは画面下部に配置
+- **スワイプジェスチャー**: リスト項目の編集・削除
+- **Pull-to-refresh**: データ更新
+- **無限スクロール**: 取引履歴の読み込み
+
+### 5.3 PWA対応
+```typescript
+// next.config.js
+const withPWA = require('next-pwa');
+
+module.exports = withPWA({
+  pwa: {
+    dest: 'public',
+    register: true,
+    skipWaiting: true,
+    runtimeCaching: [
+      {
+        urlPattern: /^https:\/\/api\./i,
+        handler: 'NetworkFirst',
+        options: {
+          cacheName: 'api-cache',
+        },
+      },
+    ],
+  },
+});
+```
+
+## 6. アクセシビリティ対応
+
+### 6.1 WCAG 2.1 AA準拠
+- **コントラスト比**: 4.5:1以上（通常テキスト）、3:1以上（大きなテキスト）
+- **フォーカス管理**: キーボードナビゲーション完全対応
+- **スクリーンリーダー**: ARIA属性適切設定
+- **カラーユニバーサルデザイン**: 色のみに依存しない情報伝達
+
+### 6.2 実装例
+```typescript
+// components/ui/Button.tsx
+const Button = ({ children, loading, ...props }) => (
+  <button
+    {...props}
+    aria-label={props['aria-label'] || children}
+    aria-busy={loading}
+    aria-disabled={props.disabled || loading}
+    className={cn(
+      "focus:ring-2 focus:ring-primary-500 focus:outline-none",
+      "transition-colors duration-200",
+      props.className
+    )}
+  >
+    {loading && <LoadingSpinner className="mr-2" />}
+    {children}
+  </button>
+);
+```
+
+## 7. パフォーマンス最適化
+
+### 7.1 Core Web Vitals対応
+- **LCP**: 2.5秒以内
+- **FID**: 100ms以内  
+- **CLS**: 0.1以内
+
+### 7.2 最適化手法
+- **コード分割**: 画面毎の動的インポート
+- **画像最適化**: Next.js Image最適化
+- **キャッシュ戦略**: SWR + React Query
+- **バンドルサイズ**: Tree-shaking + 重複除去
+
+---
+

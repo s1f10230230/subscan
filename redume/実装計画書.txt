@@ -1,0 +1,701 @@
+# 実装計画書
+
+## 1. プロジェクト概要・開発戦略
+
+### 1.1 開発方針
+- **MVP-First Approach**: 最小限の機能で価値実証後、段階的機能拡張
+- **Claude Code活用**: 各Phase毎に詳細な実装指示書を作成
+- **型安全性重視**: TypeScript + Zod + Prismaで堅牢な設計
+- **テスト駆動**: 重要機能は先にテストケース作成
+- **デプロイ最優先**: 各Phase完了後すぐにVercelデプロイ・検証
+
+### 1.2 開発環境セットアップ
+```bash
+# プロジェクト作成
+npx create-next-app@latest cardsync --typescript --tailwind --eslint --app
+
+# 必須パッケージインストール
+npm install prisma @prisma/client next-auth @next-auth/prisma-adapter
+npm install zod react-hook-form @hookform/resolvers stripe
+npm install @upstash/redis @upstash/ratelimit swr
+npm install lucide-react recharts date-fns
+npm install @radix-ui/react-dialog @radix-ui/react-dropdown-menu
+npm install class-variance-authority clsx tailwind-merge
+
+# 開発用パッケージ
+npm install -D @types/node tsx
+```
+
+### 1.3 環境変数設定（.env.local）
+```env
+# Database
+DATABASE_URL="postgresql://..."
+DIRECT_URL="postgresql://..."
+
+# NextAuth
+NEXTAUTH_URL="http://localhost:3000"
+NEXTAUTH_SECRET="your-secret-key"
+
+# Google OAuth
+GOOGLE_CLIENT_ID="your-google-client-id"
+GOOGLE_CLIENT_SECRET="your-google-client-secret"
+
+# Gmail API
+GMAIL_API_KEY="your-gmail-api-key"
+
+# Stripe
+STRIPE_PUBLISHABLE_KEY="pk_test_..."
+STRIPE_SECRET_KEY="sk_test_..."
+STRIPE_WEBHOOK_SECRET="whsec_..."
+
+# Redis (Upstash)
+UPSTASH_REDIS_REST_URL="https://..."
+UPSTASH_REDIS_REST_TOKEN="..."
+
+# Encryption
+ENCRYPTION_KEY="32-character-key-for-email-tokens"
+```
+
+## 2. Phase別実装計画
+
+### Phase 1: 基盤構築 ⚙️（推定2-3週間）
+
+#### 1.1 プロジェクト初期設定
+**実装順序:**
+1. **Prismaスキーマ設定**
+   - `prisma/schema.prisma` 作成
+   - 初期マイグレーション実行
+   - シードデータ（デフォルトカテゴリ、サブスクパターン）
+
+2. **共通ライブラリ構築**
+   - `lib/prisma.ts` - データベース接続
+   - `lib/auth.ts` - NextAuth設定
+   - `lib/utils.ts` - 汎用ヘルパー
+   - `lib/validations.ts` - Zodスキーマ
+   - `lib/encryption.ts` - 暗号化ユーティリティ
+
+3. **型定義・インターfaces**
+   - `types/` ディレクトリ全体
+   - API レスポンス型
+   - フォーム型定義
+
+**Claude Code指示例:**
+```
+Phase 1のPrismaスキーマとNextAuth設定を実装してください。
+
+要件:
+1. 提供したデータベース設計に基づくPrisma schema
+2. Google OAuth対応のNextAuth設定
+3. 型安全なPrisma Client設定
+4. デフォルトカテゴリ・サブスクパターンのシードデータ
+
+技術仕様:
+- Next.js 14 App Router
+- Prisma ORM
+- NextAuth.js v5
+- TypeScript strict mode
+
+ファイル:
+- prisma/schema.prisma
+- lib/auth.ts
+- lib/prisma.ts
+- prisma/seed.ts
+```
+
+#### 1.2 認証システム
+**実装ファイル:**
+```
+app/api/auth/[...nextauth]/route.ts    # NextAuth設定
+app/(auth)/login/page.tsx               # ログイン画面
+app/(auth)/signup/page.tsx              # サインアップ画面
+components/auth/LoginForm.tsx           # ログインフォーム
+components/auth/SocialLogin.tsx         # ソーシャルログイン
+middleware.ts                           # 認証ミドルウェア
+```
+
+#### 1.3 UI基盤・デザインシステム
+**実装ファイル:**
+```
+components/ui/                          # shadcn/ui コンポーネント
+├── Button.tsx
+├── Input.tsx
+├── Card.tsx
+├── Dialog.tsx
+└── Toast.tsx
+
+styles/globals.css                      # Tailwind設定
+lib/cn.ts                              # クラス名ユーティリティ
+```
+
+**Phase 1完了条件:**
+- [ ] ログイン・ログアウト動作確認
+- [ ] データベース接続・基本CRUD動作
+- [ ] Vercel初回デプロイ成功
+- [ ] 型安全性確認（TypeScriptエラー0）
+
+### Phase 2: コア機能実装 🏗️（推定3-4週間）
+
+#### 2.1 ユーザー管理・設定
+**実装ファイル:**
+```
+app/api/users/profile/route.ts          # プロフィールAPI
+app/(dashboard)/settings/page.tsx       # 設定画面
+components/settings/ProfileForm.tsx     # プロフィール編集
+components/settings/PreferencesForm.tsx # 環境設定
+hooks/useAuth.ts                        # 認証カスタムフック
+```
+
+#### 2.2 クレジットカード管理
+**実装ファイル:**
+```
+app/api/cards/route.ts                  # カード管理API
+app/api/cards/[id]/route.ts             # 個別カードAPI
+app/(dashboard)/cards/page.tsx          # カード一覧画面
+app/(dashboard)/cards/[id]/page.tsx     # カード詳細画面
+components/cards/CardList.tsx           # カード一覧コンポーネント
+components/cards/CardForm.tsx           # カード追加・編集フォーム
+components/cards/CardDetail.tsx         # カード詳細表示
+```
+
+#### 2.3 取引管理（手動入力）
+**実装ファイル:**
+```
+app/api/transactions/route.ts           # 取引管理API
+app/api/transactions/[id]/route.ts      # 個別取引API
+app/(dashboard)/transactions/page.tsx   # 取引一覧画面
+components/transactions/TransactionList.tsx    # 取引一覧
+components/transactions/TransactionForm.tsx    # 取引追加フォーム
+components/transactions/TransactionCard.tsx    # 取引カード
+components/transactions/CategorySelector.tsx   # カテゴリ選択
+hooks/useTransactions.ts                # 取引カスタムフック
+```
+
+**Phase 2完了条件:**
+- [ ] カード登録・編集・削除動作
+- [ ] 手動取引入力・一覧表示動作
+- [ ] カテゴリ分類機能動作
+- [ ] レスポンシブデザイン確認
+
+### Phase 3: 差別化機能（メール連携）🚀（推定4-5週間）
+
+#### 3.1 メール連携基盤
+**実装ファイル:**
+```
+app/api/email/accounts/route.ts         # メールアカウント管理
+app/api/email/sync/route.ts             # メール同期API
+app/api/email/logs/route.ts             # 処理ログAPI
+lib/email/gmail.ts                      # Gmail API連携
+lib/email/parser.ts                     # メール解析エンジン
+lib/email/patterns.ts                   # パターンマッチング
+lib/background-jobs.ts                  # バックグラウンド処理
+components/email/ConnectionForm.tsx     # メール連携フォーム
+components/email/SyncStatus.tsx         # 同期状況表示
+components/email/LogViewer.tsx          # ログ表示
+```
+
+#### 3.2 オンボーディング（WOW体験）
+**実装ファイル:**
+```
+app/(dashboard)/onboarding/page.tsx     # オンボーディングトップ
+app/(dashboard)/onboarding/[step]/page.tsx  # ステップ毎画面
+components/onboarding/WelcomeScreen.tsx     # ウェルカム画面
+components/onboarding/EmailConnection.tsx  # メール連携
+components/onboarding/AnalysisProgress.tsx # 分析プログレス
+components/onboarding/ResultsScreen.tsx    # 結果表示
+components/onboarding/PlanSelection.tsx    # プラン選択
+hooks/useOnboarding.ts                  # オンボーディング状態管理
+```
+
+#### 3.3 メール解析エンジン
+**実装詳細:**
+```typescript
+// lib/email/parser.ts の主要機能
+
+1. Gmail API連携
+   - OAuth2認証トークン管理
+   - メール検索・取得
+   - レート制限対応
+
+2. パターンマッチング
+   - クレカ会社別パターン
+   - サブスクサービス別パターン
+   - 正規表現 + 機械学習的アプローチ
+
+3. データ抽出
+   - 金額・通貨抽出
+   - 店舗名・サービス名抽出
+   - 日付正規化
+
+4. 信頼度スコアリング
+   - パターン一致度
+   - データ整合性チェック
+   - ユーザーフィードバック学習
+```
+
+**Claude Code指示例:**
+```
+Phase 3のGmail API連携とメール解析機能を実装してください。
+
+要件:
+1. Gmail OAuth2認証とメール取得
+2. クレジットカード利用通知の自動検出
+3. Netflix、Spotify等のサブスク検知
+4. 段階的処理でVercel制限回避
+5. エラーハンドリングとログ記録
+
+技術仕様:
+- Gmail API v1
+- OAuth2 PKCE flow
+- 正規表現パターンマッチング
+- バックグラウンド処理（15秒制限対応）
+- プログレスバー対応
+
+実装ファイル:
+- lib/email/gmail.ts
+- lib/email/parser.ts
+- lib/email/patterns.ts
+- app/api/email/sync/route.ts
+```
+
+**Phase 3完了条件:**
+- [ ] Gmail連携・メール取得動作
+- [ ] 主要サービス（Netflix、楽天カード等）の検知精度80%以上
+- [ ] オンボーディング「3分完了」体験実現
+- [ ] エラーログ・デバッグ機能完備
+
+### Phase 4: サブスクリプション管理 💰（推定2-3週間）
+
+#### 4.1 サブスク検知・管理
+**実装ファイル:**
+```
+app/api/subscriptions/route.ts          # サブスク管理API
+app/api/subscriptions/detect/route.ts   # 自動検知API
+app/api/subscriptions/analytics/route.ts # 節約分析API
+app/(dashboard)/subscriptions/page.tsx  # サブスク管理画面
+components/subscriptions/SubscriptionList.tsx  # サブスク一覧
+components/subscriptions/SubscriptionCard.tsx  # サブスクカード
+components/subscriptions/DetectedAlert.tsx     # 検知アラート
+components/subscriptions/SavingsCalculator.tsx # 節約計算機
+```
+
+#### 4.2 ダッシュボード統計
+**実装ファイル:**
+```
+app/api/dashboard/stats/route.ts        # ダッシュボード統計API
+app/(dashboard)/page.tsx                # ダッシュボード画面
+components/dashboard/StatsCard.tsx      # 統計カード
+components/dashboard/ExpenseChart.tsx   # 支出チャート
+components/dashboard/RecentTransactions.tsx # 最新取引
+components/dashboard/SubscriptionAlert.tsx  # サブスクアラート
+hooks/useDashboard.ts                   # ダッシュボードフック
+```
+
+**Phase 4完了条件:**
+- [ ] サブスク自動検知・手動管理機能
+- [ ] 節約可能額計算・表示機能
+- [ ] ダッシュボード統計表示
+- [ ] アラート・通知機能
+
+### Phase 5: 課金・運用機能 💳（推定2-3週間）
+
+#### 5.1 Stripe課金システム
+**実装ファイル:**
+```
+app/api/webhooks/stripe/route.ts        # Stripe Webhook
+app/api/users/subscription/route.ts     # プラン管理API
+app/(dashboard)/pricing/page.tsx        # 料金プラン画面
+app/(dashboard)/billing/page.tsx        # 課金管理画面
+components/pricing/PricingTable.tsx     # 料金表
+components/billing/BillingHistory.tsx   # 課金履歴
+lib/stripe.ts                          # Stripe設定
+```
+
+#### 5.2 運用・監視機能
+**実装ファイル:**
+```
+app/api/admin/stats/route.ts           # 管理者統計API
+app/(admin)/dashboard/page.tsx         # 管理者画面
+components/admin/UserStats.tsx         # ユーザー統計
+components/admin/SystemHealth.tsx      # システム状況
+lib/monitoring.ts                      # 監視・アラート
+```
+
+**Phase 5完了条件:**
+- [ ] 3つのプラン（Free/Standard/Pro）課金動作
+- [ ] プラン制限・機能制御
+- [ ] 管理者ダッシュボード
+- [ ] システム監視・アラート
+
+## 3. 技術実装詳細
+
+### 3.1 重要機能の実装方針
+
+#### Gmail API連携
+```typescript
+// lib/email/gmail.ts 実装方針
+
+class GmailService {
+  // OAuth2トークン管理
+  async refreshAccessToken(refreshToken: string): Promise<string>
+  
+  // メール検索・取得（ページネーション対応）
+  async searchEmails(query: string, maxResults: number): Promise<EmailMessage[]>
+  
+  // レート制限対応
+  async withRateLimit<T>(fn: () => Promise<T>): Promise<T>
+  
+  // エラーハンドリング
+  async handleGmailError(error: any): Promise<void>
+}
+
+// 検索クエリ例
+const buildSearchQuery = (dateRange: DateRange) => {
+  const senders = [
+    'noreply@account.netflix.com',
+    'account-update@amazon.co.jp', 
+    'rakuten-card.co.jp'
+  ].join(' OR from:');
+  
+  return `from:(${senders}) after:${formatDate(dateRange.start)}`;
+};
+```
+
+#### メール解析エンジン
+```typescript
+// lib/email/parser.ts 実装方針
+
+interface ExtractionResult {
+  success: boolean;
+  confidence: number; // 0.0 - 1.0
+  data?: {
+    amount: number;
+    currency: string;
+    merchantName: string;
+    serviceType: 'SUBSCRIPTION' | 'TRANSACTION';
+  };
+  errors: string[];
+}
+
+class EmailParser {
+  // パターンマッチング
+  async extractFromEmail(email: EmailMessage): Promise<ExtractionResult>
+  
+  // 段階的検証
+  async validateExtraction(result: ExtractionResult): Promise<boolean>
+  
+  // 学習・改善
+  async learnFromCorrection(original: ExtractionResult, corrected: any): Promise<void>
+}
+```
+
+#### バックグラウンド処理（Vercel対応）
+```typescript
+// lib/background-jobs.ts 実装方針
+
+class BackgroundJobManager {
+  // 段階的処理でタイムアウト回避
+  async processInBatches<T>(
+    items: T[], 
+    batchSize: number,
+    processor: (batch: T[]) => Promise<any>
+  ): Promise<void>
+  
+  // 処理継続のための次回スケジュール
+  async scheduleNextBatch(jobId: string, startIndex: number): Promise<void>
+  
+  // プログレス管理
+  async updateProgress(jobId: string, progress: number): Promise<void>
+}
+```
+
+### 3.2 パフォーマンス最適化
+
+#### キャッシュ戦略
+```typescript
+// Redis キャッシュパターン
+const CACHE_KEYS = {
+  USER_PROFILE: (userId: string) => `user:${userId}:profile`,
+  DASHBOARD_STATS: (userId: string) => `dashboard:${userId}:stats`,
+  TRANSACTIONS: (userId: string, page: number) => `transactions:${userId}:${page}`,
+  SUBSCRIPTIONS: (userId: string) => `subscriptions:${userId}`
+};
+
+const CACHE_TTL = {
+  USER_PROFILE: 300,      // 5分
+  DASHBOARD_STATS: 60,    // 1分  
+  TRANSACTIONS: 30,       // 30秒
+  SUBSCRIPTIONS: 300      // 5分
+};
+```
+
+#### データベース最適化
+```sql
+-- 重要なインデックス
+CREATE INDEX idx_transactions_user_date ON transactions(user_id, transaction_date DESC);
+CREATE INDEX idx_email_data_account_received ON email_data(email_account_id, received_at DESC);
+CREATE INDEX idx_subscriptions_user_status ON subscriptions(user_id, status);
+```
+
+### 3.3 エラーハンドリング・ログ戦略
+
+#### 統一エラーハンドリング
+```typescript
+// lib/error-handler.ts
+export class AppError extends Error {
+  constructor(
+    public code: string,
+    message: string,
+    public statusCode: number = 500,
+    public isOperational: boolean = true
+  ) {
+    super(message);
+  }
+}
+
+// エラー分類
+export const ERROR_CODES = {
+  // 認証関連
+  UNAUTHORIZED: 'UNAUTHORIZED',
+  FORBIDDEN: 'FORBIDDEN',
+  
+  // データ関連  
+  NOT_FOUND: 'NOT_FOUND',
+  VALIDATION_ERROR: 'VALIDATION_ERROR',
+  DUPLICATE_ENTRY: 'DUPLICATE_ENTRY',
+  
+  // 外部API関連
+  GMAIL_API_ERROR: 'GMAIL_API_ERROR',
+  RATE_LIMIT_EXCEEDED: 'RATE_LIMIT_EXCEEDED',
+  
+  // 処理関連
+  EMAIL_PARSING_FAILED: 'EMAIL_PARSING_FAILED',
+  BACKGROUND_JOB_FAILED: 'BACKGROUND_JOB_FAILED'
+} as const;
+```
+
+## 4. テスト戦略
+
+### 4.1 テスト分類・優先度
+
+#### 単体テスト（高優先度）
+```typescript
+// __tests__/lib/email/parser.test.ts
+describe('EmailParser', () => {
+  test('Netflix subscription detection', async () => {
+    const mockEmail = {
+      subject: 'Netflix - お支払いのお知らせ',
+      sender: 'noreply@account.netflix.com',
+      body: '月額プラン ¥1,490の支払いが完了しました'
+    };
+    
+    const result = await parser.extractFromEmail(mockEmail);
+    
+    expect(result.success).toBe(true);
+    expect(result.confidence).toBeGreaterThan(0.9);
+    expect(result.data?.amount).toBe(1490);
+    expect(result.data?.serviceType).toBe('SUBSCRIPTION');
+  });
+});
+```
+
+#### 統合テスト（中優先度）  
+```typescript
+// __tests__/api/email/sync.test.ts
+describe('/api/email/sync', () => {
+  test('Gmail sync with real email data', async () => {
+    // テスト用のGmailアカウント使用
+    const response = await request(app)
+      .post('/api/email/sync')
+      .set('Authorization', `Bearer ${testToken}`)
+      .send({ accountId: testAccountId });
+      
+    expect(response.status).toBe(200);
+    expect(response.body.success).toBe(true);
+  });
+});
+```
+
+#### E2Eテスト（低優先度）
+```typescript
+// e2e/onboarding.spec.ts - Playwright使用
+test('onboarding flow completes successfully', async ({ page }) => {
+  await page.goto('/onboarding');
+  await page.click('text=Gmailで始める');
+  // Gmail OAuth flow simulation
+  await page.waitForSelector('[data-testid=analysis-progress]');
+  await page.waitForSelector('[data-testid=results-screen]', { timeout: 180000 });
+  
+  expect(await page.textContent('[data-testid=subscriptions-found]')).toContain('個のサブスクを発見');
+});
+```
+
+### 4.2 テストデータ・モック戦略
+
+#### メールサンプルデータ
+```typescript
+// __tests__/__fixtures__/email-samples.ts
+export const NETFLIX_EMAIL = {
+  messageId: 'netflix-test-001',
+  subject: 'Netflix - お支払いのお知らせ',
+  sender: 'noreply@account.netflix.com',
+  receivedAt: new Date('2024-01-15T10:00:00Z'),
+  body: `
+    Netflixプレミアムプランの月額料金¥1,490のお支払いが完了いたしました。
+    次回のお支払い予定日: 2024年2月15日
+  `
+};
+
+export const RAKUTEN_CARD_EMAIL = {
+  messageId: 'rakuten-test-001', 
+  subject: '【楽天カード】ご利用のお知らせ',
+  sender: 'info@mail.rakuten-card.co.jp',
+  receivedAt: new Date('2024-01-16T14:30:00Z'),
+  body: `
+    ご利用日時: 2024/01/16 14:25
+    ご利用店舗: Amazon.co.jp
+    ご利用金額: 2,480円
+  `
+};
+```
+
+## 5. デプロイメント・CI/CD
+
+### 5.1 Vercelデプロイ設定
+```json
+// vercel.json
+{
+  "framework": "nextjs",
+  "buildCommand": "npm run build",
+  "devCommand": "npm run dev",
+  "installCommand": "npm install",
+  "functions": {
+    "app/api/**/*.ts": {
+      "maxDuration": 30
+    }
+  },
+  "env": {
+    "DATABASE_URL": "@database-url",
+    "NEXTAUTH_SECRET": "@nextauth-secret"
+  }
+}
+```
+
+### 5.2 GitHub Actions CI/CD
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy to Vercel
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run test
+      - run: npm run type-check
+      
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.ORG_ID }}
+          vercel-project-id: ${{ secrets.PROJECT_ID }}
+          vercel-args: '--prod'
+```
+
+## 6. 運用・監視計画
+
+### 6.1 監視項目
+- **アプリケーション**: エラー率、レスポンス時間
+- **インフラ**: Vercel Function実行時間、データベース接続
+- **ビジネス**: ユーザー登録数、メール同期成功率、課金転換率
+- **セキュリティ**: 異常ログイン検知、API不正利用
+
+### 6.2 アラート設定
+```typescript
+// lib/monitoring.ts
+export const ALERT_THRESHOLDS = {
+  EMAIL_SYNC_ERROR_RATE: 0.2,      // 20%以上
+  API_RESPONSE_TIME: 3000,         // 3秒以上
+  GMAIL_API_QUOTA_USAGE: 0.8,      // 80%以上
+  DATABASE_CONNECTION_ERROR: 1     // 1件でも
+};
+```
+
+## 7. Claude Code実装指示テンプレート
+
+### 7.1 Phase別実装指示
+```markdown
+## Phase [N]: [フェーズ名] 実装指示
+
+### 概要
+[このPhaseで実装する機能の概要]
+
+### 要件
+1. [機能要件1]
+2. [機能要件2] 
+3. [非機能要件1]
+
+### 技術仕様
+- Framework: Next.js 14 App Router
+- Database: PostgreSQL + Prisma
+- Authentication: NextAuth.js
+- UI: Tailwind CSS + shadcn/ui
+- Validation: Zod
+
+### 実装ファイル
+```
+[ファイルパス1]
+[ファイルパス2]
+```
+
+### 実装順序
+1. [タスク1] - [推定時間]
+2. [タスク2] - [推定時間]
+
+### テスト要件
+- [ ] [テストケース1]
+- [ ] [テストケース2]
+
+### 完了条件
+- [ ] [条件1]
+- [ ] [条件2]
+```
+
+## 8. リスク管理・対策
+
+### 8.1 技術リスク
+| リスク | 影響度 | 対策 |
+|--------|--------|------|
+| Gmail API制限 | 高 | レート制限実装、複数アカウント対応 |
+| メール解析精度 | 高 | テストデータ充実、段階的改善 |
+| Vercel制限 | 中 | バックグラウンド処理最適化 |
+| データベース負荷 | 中 | インデックス最適化、キャッシュ活用 |
+
+### 8.2 ビジネスリスク  
+| リスク | 影響度 | 対策 |
+|--------|--------|------|
+| 競合参入 | 中 | 差別化機能の強化、ユーザー体験向上 |
+| 法規制変更 | 低 | プライバシーポリシー整備、GDPR対応 |
+| 課金システム障害 | 高 | Stripe冗長化、障害時対応フロー |
+
+---
+
+この実装計画書により、Claude Codeを使った段階的で確実な開発が可能になります。各Phaseの完了後にはデプロイ・テストを行い、ユーザーフィードバックを収集しながら次のPhaseに進む戦略です。
+
+実装を開始しますか？それとも計画について調整したい点はありますか？

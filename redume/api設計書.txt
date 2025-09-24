@@ -1,0 +1,1747 @@
+# API設計書
+
+## 1. API設計原則
+
+### 1.1 基本方針
+- **RESTful設計**: 標準的なHTTPメソッドとステータスコード
+- **JSON API**: レスポンス形式の統一
+- **型安全性**: TypeScriptによる厳密な型定義
+- **エラーハンドリング**: 統一されたエラーレスポンス形式
+- **パフォーマンス**: キャッシュ戦略・ページネーション
+- **セキュリティ**: 認証・認可・レート制限
+
+### 1.2 Next.js API Routes構成
+```
+app/api/
+├── auth/                    # 認証関連
+│   ├── session/route.ts     # セッション確認
+│   └── [...nextauth]/route.ts # NextAuth.js
+├── users/                   # ユーザー管理
+│   ├── profile/route.ts     # プロフィール
+│   ├── preferences/route.ts # 設定
+│   └── subscription/route.ts # 課金プラン
+├── email/                   # メール連携
+│   ├── accounts/route.ts    # メールアカウント管理
+│   ├── sync/route.ts        # メール同期
+│   └── logs/route.ts        # 処理ログ
+├── cards/                   # クレジットカード
+│   ├── route.ts             # カード一覧・追加
+│   └── [id]/                # 個別カード
+│       ├── route.ts         # 詳細・更新・削除
+│       └── analytics/route.ts # 利用分析
+├── transactions/            # 取引管理
+│   ├── route.ts             # 一覧・作成
+│   ├── [id]/route.ts        # 詳細・更新・削除
+│   ├── bulk/route.ts        # 一括操作
+│   └── analytics/route.ts   # 分析データ
+├── subscriptions/           # サブスク管理
+│   ├── route.ts             # 一覧・作成
+│   ├── [id]/route.ts        # 詳細・更新・削除
+│   ├── detect/route.ts      # 自動検知
+│   └── analytics/route.ts   # 節約分析
+├── categories/              # カテゴリ管理
+│   └── route.ts             # 一覧・カスタム作成
+├── dashboard/               # ダッシュボード
+│   └── stats/route.ts       # 統計データ
+└── webhooks/                # Webhook
+    └── stripe/route.ts      # Stripe課金
+```
+
+## 2. 共通仕様
+
+### 2.1 統一レスポンス形式
+```typescript
+// 成功レスポンス
+interface ApiSuccessResponse<T = any> {
+  success: true;
+  data: T;
+  meta?: {
+    pagination?: PaginationMeta;
+    timestamp: string;
+    requestId: string;
+  };
+}
+
+// エラーレスポンス
+interface ApiErrorResponse {
+  success: false;
+  error: {
+    code: string;           // 'UNAUTHORIZED', 'VALIDATION_ERROR'
+    message: string;        // ユーザー向けメッセージ
+    details?: any;          // 詳細情報（開発用）
+  };
+  meta: {
+    timestamp: string;
+    requestId: string;
+  };
+}
+
+// ページネーション
+interface PaginationMeta {
+  page: number;
+  limit: number;
+  total: number;
+  totalPages: number;
+  hasNext: boolean;
+  hasPrev: boolean;
+}
+```
+
+### 2.2 認証・認可
+```typescript
+// middleware.ts
+import { withAuth } from "next-auth/middleware";
+
+export default withAuth({
+  pages: {
+    signIn: "/login",
+  },
+});
+
+export const config = {
+  matcher: ["/api/((?!auth|webhooks).*)"], // 認証が必要なAPI
+};
+
+// 共通認証ヘルパー
+async function requireAuth(req: NextRequest): Promise<User | null> {
+  const token = await getToken({ req });
+  if (!token) {
+    throw new ApiError('UNAUTHORIZED', 'ログインが必要です', 401);
+  }
+  return await prisma.user.findUnique({ 
+    where: { id: token.sub },
+    include: { emailAccounts: true, creditCards: true }
+  });
+}
+
+// プラン制限チェック
+async function requirePlan(user: User, requiredPlan: PlanType): Promise<void> {
+  const planHierarchy = { FREE: 0, STANDARD: 1, PRO: 2 };
+  if (planHierarchy[user.plan] < planHierarchy[requiredPlan]) {
+    throw new ApiError('PLAN_REQUIRED', `${requiredPlan}プランが必要です`, 402);
+  }
+}
+```
+
+### 2.3 エラーハンドリング
+```typescript
+// lib/api-error.ts
+export class ApiError extends Error {
+  constructor(
+    public code: string,
+    message: string,
+    public status: number = 500,
+    public details?: any
+  ) {
+    super(message);
+  }
+}
+
+// 共通エラーハンドラー
+export function handleApiError(error: unknown): Response {
+  if (error instanceof ApiError) {
+    return NextResponse.json({
+      success: false,
+      error: {
+        code: error.code,
+        message: error.message,
+        details: error.details
+      },
+      meta: {
+        timestamp: new Date().toISOString(),
+        requestId: crypto.randomUUID()
+      }
+    }, { status: error.status });
+  }
+  
+  // 予期しないエラー
+  console.error('Unexpected API error:', error);
+  return NextResponse.json({
+    success: false,
+    error: {
+      code: 'INTERNAL_ERROR',
+      message: 'サーバーエラーが発生しました'
+    }
+  }, { status: 500 });
+}
+```
+
+## 3. 認証API
+
+### 3.1 NextAuth.js設定
+```typescript
+// app/api/auth/[...nextauth]/route.ts
+import NextAuth from "next-auth";
+import GoogleProvider from "next-auth/providers/google";
+import { PrismaAdapter } from "@next-auth/prisma-adapter";
+
+const handler = NextAuth({
+  adapter: PrismaAdapter(prisma),
+  providers: [
+    GoogleProvider({
+      clientId: process.env.GOOGLE_CLIENT_ID!,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+      authorization: {
+        params: {
+          scope: 'openid email profile https://www.googleapis.com/auth/gmail.readonly'
+        }
+      }
+    })
+  ],
+  callbacks: {
+    async jwt({ token, account }) {
+      if (account) {
+        token.accessToken = account.access_token;
+        token.refreshToken = account.refresh_token;
+      }
+      return token;
+    },
+    async session({ session, token }) {
+      session.accessToken = token.accessToken;
+      return session;
+    }
+  },
+  pages: {
+    signIn: '/login',
+    error: '/auth/error',
+  }
+});
+
+export { handler as GET, handler as POST };
+```
+
+### 3.2 セッション確認
+```typescript
+// app/api/auth/session/route.ts
+export async function GET(req: NextRequest) {
+  try {
+    const user = await requireAuth(req);
+    
+    return NextResponse.json({
+      success: true,
+      data: {
+        user: {
+          id: user.id,
+          email: user.email,
+          name: user.name,
+          image: user.image,
+          plan: user.plan,
+          monthStartDay: user.monthStartDay,
+        },
+        hasEmailConnection: user.emailAccounts.length > 0,
+        creditCardCount: user.creditCards.length
+      }
+    });
+  } catch (error) {
+    return handleApiError(error);
+  }
+}
+```
+
+## 4. ユーザー管理API
+
+### 4.1 プロフィール管理
+```typescript
+// app/api/users/profile/route.ts
+
+// プロフィール取得
+export async function GET(req: NextRequest) {
+  try {
+    const user = await requireAuth(req);
+    
+    return NextResponse.json({
+      success: true,
+      data: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        image: user.image,
+        plan: user.plan,
+        monthStartDay: user.monthStartDay,
+        timezone: user.timezone,
+        createdAt: user.createdAt
+      }
+    });
+  } catch (error) {
+    return handleApiError(error);
+  }
+}
+
+// プロフィール更新
+export async function PATCH(req: NextRequest) {
+  try {
+    const user = await requireAuth(req);
+    const data = await req.json();
+    
+    // バリデーション
+    const updateSchema = z.object({
+      name: z.string().min(1).max(100).optional(),
+      monthStartDay: z.number().min(1).max(28).optional(),
+      timezone: z.string().optional()
+    });
+    
+    const validatedData = updateSchema.parse(data);
+    
+    const updatedUser = await prisma.user.update({
+      where: { id: user.id },
+      data: validatedData
+    });
+    
+    return NextResponse.json({
+      success: true,
+      data: updatedUser
+    });
+  } catch (error) {
+    return handleApiError(error);
+  }
+}
+```
+
+## 5. メール連携API
+
+### 5.1 メールアカウント管理
+```typescript
+// app/api/email/accounts/route.ts
+
+// メールアカウント一覧
+export async function GET(req: NextRequest) {
+  try {
+    const user = await requireAuth(req);
+    
+    const accounts = await prisma.emailAccount.findMany({
+      where: { userId: user.id },
+      select: {
+        id: true,
+        emailAddress: true,
+        provider: true,
+        isActive: true,
+        lastSync: true,
+        createdAt: true
+      }
+    });
+    
+    return NextResponse.json({
+      success: true,
+      data: accounts
+    });
+  } catch (error) {
+    return handleApiError(error);
+  }
+}
+
+// メールアカウント追加
+export async function POST(req: NextRequest) {
+  try {
+    const user = await requireAuth(req);
+    const { provider, accessToken, refreshToken } = await req.json();
+    
+    // 既存アカウントの重複チェック
+    const existingAccount = await prisma.emailAccount.findFirst({
+      where: { 
+        userId: user.id,
+        provider: provider
+      }
+    });
+    
+    if (existingAccount) {
+      throw new ApiError('DUPLICATE_ACCOUNT', '既に連携済みです', 400);
+    }
+    
+    // アカウント情報を暗号化して保存
+    const encryptedAccessToken = encrypt(accessToken);
+    const encryptedRefreshToken = refreshToken ? encrypt(refreshToken) : null;
+    
+    const emailAccount = await prisma.emailAccount.create({
+      data: {
+        userId: user.id,
+        emailAddress: user.email, // Google OAuth から取得
+        provider: provider,
+        accessToken: encryptedAccessToken,
+        refreshToken: encryptedRefreshToken,
+        isActive: true
+      }
+    });
+    
+    // 初回同期をバックグラウンドで開始
+    await scheduleEmailSync(emailAccount.id);
+    
+    return NextResponse.json({
+      success: true,
+      data: {
+        id: emailAccount.id,
+        emailAddress: emailAccount.emailAddress,
+        provider: emailAccount.provider,
+        isActive: emailAccount.isActive
+      }
+    });
+  } catch (error) {
+    return handleApiError(error);
+  }
+}
+```
+
+### 5.2 メール同期処理
+```typescript
+// app/api/email/sync/route.ts
+
+// 同期状況確認
+export async function GET(req: NextRequest) {
+  try {
+    const user = await requireAuth(req);
+    const { searchParams } = new URL(req.url);
+    const accountId = searchParams.get('accountId');
+    
+    const account = await prisma.emailAccount.findFirst({
+      where: { 
+        id: accountId,
+        userId: user.id 
+      }
+    });
+    
+    if (!account) {
+      throw new ApiError('NOT_FOUND', 'メールアカウントが見つかりません', 404);
+    }
+    
+    // 進行中のジョブがあるかチェック
+    const activeJob = await getActiveEmailJob(account.id);
+    
+    return NextResponse.json({
+      success: true,
+      data: {
+        account: {
+          id: account.id,
+          lastSync: account.lastSync,
+          isActive: account.isActive
+        },
+        syncStatus: activeJob ? {
+          jobId: activeJob.id,
+          status: activeJob.status,
+          progress: activeJob.progress,
+          estimatedTimeRemaining: activeJob.estimatedTimeRemaining
+        } : null
+      }
+    });
+  } catch (error) {
+    return handleApiError(error);
+  }
+}
+
+// 手動同期開始
+export async function POST(req: NextRequest) {
+  try {
+    const user = await requireAuth(req);
+    const { accountId } = await req.json();
+    
+    // プラン制限チェック（無料版は同期不可）
+    await requirePlan(user, 'STANDARD');
+    
+    const account = await prisma.emailAccount.findFirst({
+      where: { 
+        id: accountId,
+        userId: user.id 
+      }
+    });
+    
+    if (!account) {
+      throw new ApiError('NOT_FOUND', 'メールアカウントが見つかりません', 404);
+    }
+    
+    // 既に同期中でないかチェック
+    const activeJob = await getActiveEmailJob(account.id);
+    if (activeJob) {
+      throw new ApiError('SYNC_IN_PROGRESS', '同期処理が実行中です', 409);
+    }
+    
+    // 同期ジョブを作成・開始
+    const job = await createEmailSyncJob({
+      userId: user.id,
+      emailAccountId: account.id,
+      dateRange: getDateRangeForPlan(user.plan) // FREE: なし, STANDARD: 3ヶ月, PRO: 1年
+    });
+    
+    // バックグラウンド処理開始
+    await startEmailSyncJob(job.id);
+    
+    return NextResponse.json({
+      success: true,
+      data: {
+        jobId: job.id,
+        status: 'PENDING',
+        message: 'メール同期を開始しました'
+      }
+    });
+  } catch (error) {
+    return handleApiError(error);
+  }
+}
+```
+
+### 5.3 処理ログAPI
+```typescript
+// app/api/email/logs/route.ts
+export async function GET(req: NextRequest) {
+  try {
+    const user = await requireAuth(req);
+    const { searchParams } = new URL(req.url);
+    const page = parseInt(searchParams.get('page') || '1');
+    const limit = Math.min(parseInt(searchParams.get('limit') || '20'), 100);
+    const accountId = searchParams.get('accountId');
+    
+    const where = {
+      emailAccount: {
+        userId: user.id,
+        ...(accountId && { id: accountId })
+      }
+    };
+    
+    const [logs, total] = await Promise.all([
+      prisma.emailData.findMany({
+        where,
+        include: {
+          emailAccount: {
+            select: { emailAddress: true, provider: true }
+          }
+        },
+        orderBy: { createdAt: 'desc' },
+        skip: (page - 1) * limit,
+        take: limit
+      }),
+      prisma.emailData.count({ where })
+    ]);
+    
+    // エラーログも取得
+    const errors = await prisma.emailProcessingError.findMany({
+      where: {
+        emailData: {
+          emailAccount: {
+            userId: user.id
+          }
+        }
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 10
+    });
+    
+    return NextResponse.json({
+      success: true,
+      data: {
+        logs: logs.map(log => ({
+          id: log.id,
+          emailAccount: log.emailAccount,
+          sender: log.sender,
+          subject: log.subject,
+          receivedAt: log.receivedAt,
+          extractedAmount: log.extractedAmount,
+          extractedCurrency: log.extractedCurrency,
+          merchantName: log.merchantName,
+          processed: log.processed,
+          processedAt: log.processedAt
+        })),
+        errors: errors.map(error => ({
+          id: error.id,
+          errorType: error.errorType,
+          errorMessage: error.errorMessage,
+          emailSubject: maskSensitiveInfo(error.emailSubject),
+          emailSender: error.emailSender,
+          createdAt: error.createdAt
+        }))
+      },
+      meta: {
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+          hasNext: page < Math.ceil(total / limit),
+          hasPrev: page > 1
+        }
+      }
+    });
+  } catch (error) {
+    return handleApiError(error);
+  }
+}
+
+// 機密情報のマスキング
+function maskSensitiveInfo(text: string): string {
+  return text.replace(/\d{4}/g, '****')  // 4桁の数字をマスク
+             .replace(/\d{3,}/g, match => '*'.repeat(match.length)); // 3桁以上の数字をマスク
+}
+```
+
+## 6. クレジットカードAPI
+
+### 6.1 カード管理
+```typescript
+// app/api/cards/route.ts
+
+// カード一覧取得
+export async function GET(req: NextRequest) {
+  try {
+    const user = await requireAuth(req);
+    
+    const cards = await prisma.creditCard.findMany({
+      where: { 
+        userId: user.id,
+        isActive: true 
+      },
+      include: {
+        _count: {
+          select: { transactions: true }
+        }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+    
+    return NextResponse.json({
+      success: true,
+      data: cards.map(card => ({
+        id: card.id,
+        name: card.name,
+        brand: card.brand,
+        issuer: card.issuer,
+        lastDigits: card.lastDigits,
+        color: card.color,
+        transactionCount: card._count.transactions,
+        createdAt: card.createdAt
+      }))
+    });
+  } catch (error) {
+    return handleApiError(error);
+  }
+}
+
+// カード追加
+export async function POST(req: NextRequest) {
+  try {
+    const user = await requireAuth(req);
+    const data = await req.json();
+    
+    const cardSchema = z.object({
+      name: z.string().min(1).max(50),
+      brand: z.enum(['VISA', 'MasterCard', 'JCB', 'AMEX']),
+      issuer: z.string().min(1).max(50),
+      lastDigits: z.string().length(4).regex(/^\d{4}$/),
+      color: z.string().regex(/^#[0-9A-Fa-f]{6}$/)
+    });
+    
+    const validatedData = cardSchema.parse(data);
+    
+    // 重複チェック
+    const existingCard = await prisma.creditCard.findFirst({
+      where: {
+        userId: user.id,
+        issuer: validatedData.issuer,
+        lastDigits: validatedData.lastDigits
+      }
+    });
+    
+    if (existingCard) {
+      throw new ApiError('DUPLICATE_CARD', '既に登録済みのカードです', 400);
+    }
+    
+    const card = await prisma.creditCard.create({
+      data: {
+        ...validatedData,
+        userId: user.id
+      }
+    });
+    
+    return NextResponse.json({
+      success: true,
+      data: card
+    }, { status: 201 });
+  } catch (error) {
+    return handleApiError(error);
+  }
+}
+```
+
+### 6.2 カード別分析
+```typescript
+// app/api/cards/[id]/analytics/route.ts
+export async function GET(req: NextRequest, { params }: { params: { id: string } }) {
+  try {
+    const user = await requireAuth(req);
+    const { searchParams } = new URL(req.url);
+    const period = searchParams.get('period') || 'month'; // month, quarter, year
+    
+    const card = await prisma.creditCard.findFirst({
+      where: { 
+        id: params.id,
+        userId: user.id 
+      }
+    });
+    
+    if (!card) {
+      throw new ApiError('NOT_FOUND', 'カードが見つかりません', 404);
+    }
+    
+    const dateRange = getDateRangeForPeriod(period);
+    
+    // 基本統計
+    const stats = await prisma.transaction.aggregate({
+      where: {
+        creditCardId: card.id,
+        transactionDate: {
+          gte: dateRange.start,
+          lte: dateRange.end
+        }
+      },
+      _sum: { amount: true },
+      _count: true,
+      _avg: { amount: true }
+    });
+    
+    // 月次推移データ
+    const monthlyData = await prisma.transaction.groupBy({
+      by: ['transactionDate'],
+      where: {
+        creditCardId: card.id,
+        transactionDate: {
+          gte: dateRange.start,
+          lte: dateRange.end
+        }
+      },
+      _sum: { amount: true },
+      orderBy: { transactionDate: 'asc' }
+    });
+    
+    // カテゴリ別内訳
+    const categoryBreakdown = await prisma.transaction.groupBy({
+      by: ['categoryId'],
+      where: {
+        creditCardId: card.id,
+        transactionDate: {
+          gte: dateRange.start,
+          lte: dateRange.end
+        }
+      },
+      _sum: { amount: true },
+      _count: true
+    });
+    
+    // カテゴリ名を取得
+    const categories = await prisma.category.findMany({
+      where: {
+        id: { in: categoryBreakdown.map(c => c.categoryId) }
+      }
+    });
+    
+    // トップ利用店舗
+    const topMerchants = await prisma.transaction.groupBy({
+      by: ['merchantName'],
+      where: {
+        creditCardId: card.id,
+        transactionDate: {
+          gte: dateRange.start,
+          lte: dateRange.end
+        }
+      },
+      _sum: { amount: true },
+      _count: true,
+      orderBy: { _sum: { amount: 'desc' } },
+      take: 5
+    });
+    
+    return NextResponse.json({
+      success: true,
+      data: {
+        card: {
+          id: card.id,
+          name: card.name,
+          issuer: card.issuer,
+          lastDigits: card.lastDigits
+        },
+        period,
+        summary: {
+          totalAmount: stats._sum.amount || 0,
+          transactionCount: stats._count,
+          averagePerTransaction: Math.round(stats._avg.amount || 0),
+          monthlyAverage: Math.round((stats._sum.amount || 0) / getMonthCountForPeriod(period))
+        },
+        charts: {
+          monthly: formatMonthlyData(monthlyData),
+          categories: formatCategoryData(categoryBreakdown, categories)
+        },
+        insights: {
+          topMerchant: topMerchants[0]?.merchantName,
+          peakMonth: findPeakMonth(monthlyData),
+          unusualSpending: await detectUnusualSpending(card.id, dateRange)
+        }
+      }
+    });
+  } catch (error) {
+    return handleApiError(error);
+  }
+}
+```
+
+## 7. 取引管理API
+
+### 7.1 取引CRUD
+```typescript
+// app/api/transactions/route.ts
+
+// 取引一覧（ページネーション付き）
+export async function GET(req: NextRequest) {
+  try {
+    const user = await requireAuth(req);
+    const { searchParams } = new URL(req.url);
+    
+    const page = parseInt(searchParams.get('page') || '1');
+    const limit = Math.min(parseInt(searchParams.get('limit') || '20'), 100);
+    const categoryId = searchParams.get('categoryId');
+    const creditCardId = searchParams.get('creditCardId');
+    const startDate = searchParams.get('startDate');
+    const endDate = searchParams.get('endDate');
+    const search = searchParams.get('search');
+    
+    // フィルタ条件構築
+    const where: any = { userId: user.id };
+    
+    if (categoryId) where.categoryId = categoryId;
+    if (creditCardId) where.creditCardId = creditCardId;
+    if (startDate && endDate) {
+      where.transactionDate = {
+        gte: new Date(startDate),
+        lte: new Date(endDate)
+      };
+    }
+    if (search) {
+      where.OR = [
+        { merchantName: { contains: search, mode: 'insensitive' } },
+        { description: { contains: search, mode: 'insensitive' } }
+      ];
+    }
+    
+    const [transactions, total] = await Promise.all([
+      prisma.transaction.findMany({
+        where,
+        include: {
+          category: { select: { name: true, icon: true, color: true } },
+          creditCard: { select: { name: true, issuer: true, lastDigits: true } }
+        },
+        orderBy: { transactionDate: 'desc' },
+        skip: (page - 1) * limit,
+        take: limit
+      }),
+      prisma.transaction.count({ where })
+    ]);
+    
+    return NextResponse.json({
+      success: true,
+      data: transactions,
+      meta: {
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+          hasNext: page < Math.ceil(total / limit),
+          hasPrev: page > 1
+        }
+      }
+    });
+  } catch (error) {
+    return handleApiError(error);
+  }
+}
+
+// 取引作成（手動入力）
+export async function POST(req: NextRequest) {
+  try {
+    const user = await requireAuth(req);
+    const data = await req.json();
+    
+    const transactionSchema = z.object({
+      creditCardId: z.string().cuid(),
+      categoryId: z.string().cuid(),
+      amount: z.number().positive(),
+      currency: z.string().default('JPY'),
+      merchantName: z.string().min(1).max(100),
+      description: z.string().max(500).optional(),
+      transactionDate: z.string().transform(str => new Date(str))
+    });
+    
+    const validatedData = transactionSchema.parse(data);
+    
+    // カードとカテゴリの所有権チェック
+    const [card, category] = await Promise.all([
+      prisma.creditCard.findFirst({
+        where: { id: validatedData.creditCardId, userId: user.id }
+      }),
+      prisma.category.findFirst({
+        where: { 
+          id: validatedData.categoryId,
+          OR: [
+            { userId: user.id },
+            { isDefault: true }
+          ]
+        }
+      })
+    ]);
+    
+    if (!card) throw new ApiError('INVALID_CARD', '無効なカードです', 400);
+    if (!category) throw new ApiError('INVALID_CATEGORY', '無効なカテゴリです', 400);
+    
+    const transaction = await prisma.transaction.create({
+      data: {
+        ...validatedData,
+        userId: user.id,
+        source: 'MANUAL',
+        isVerified: true
+      },
+      include: {
+        category: { select: { name: true, icon: true, color: true } },
+        creditCard: { select: { name: true, issuer: true, lastDigits: true } }
+      }
+    });
+    
+    return NextResponse.json({
+      success: true,
+      data: transaction
+    }, { status: 201 });
+  } catch (error) {
+    return handleApiError(error);
+  }
+}
+```
+
+## 8. サブスクリプション管理API
+
+### 8.1 サブスク検知・管理
+```typescript
+// app/api/subscriptions/detect/route.ts
+
+// 自動検知実行
+export async function POST(req: NextRequest) {
+  try {
+    const user = await requireAuth(req);
+    await requirePlan(user, 'STANDARD');
+    
+    const { emailAccountId } = await req.json();
+    
+    const emailAccount = await prisma.emailAccount.findFirst({
+      where: { 
+        id: emailAccountId,
+        userId: user.id 
+      }
+    });
+    
+    if (!emailAccount) {
+      throw new ApiError('NOT_FOUND', 'メールアカウントが見つかりません', 404);
+    }
+    
+    // 検知ジョブを作成
+    const job = await createSubscriptionDetectionJob({
+      userId: user.id,
+      emailAccountId: emailAccount.id
+    });
+    
+    // バックグラウンド処理開始
+    await startSubscriptionDetection(job.id);
+    
+    return NextResponse.json({
+      success: true,
+      data: {
+        jobId: job.id,
+        message: 'サブスクリプション検知を開始しました'
+      }
+    });
+  } catch (error) {
+    return handleApiError(error);
+  }
+}
+
+// 検知結果取得
+export async function GET(req: NextRequest) {
+  try {
+    const user = await requireAuth(req);
+    const { searchParams } = new URL(req.url);
+    const jobId = searchParams.get('jobId');
+    
+    if (jobId) {
+      // 特定のジョブの進捗確認
+      const job = await getSubscriptionDetectionJob(jobId);
+      if (!job || job.userId !== user.id) {
+        throw new ApiError('NOT_FOUND', 'ジョブが見つかりません', 404);
+      }
+      
+      return NextResponse.json({
+        success: true,
+        data: {
+          jobId: job.id,
+          status: job.status,
+          progress: job.progress,
+          results: job.status === 'COMPLETED' ? {
+            subscriptionsFound: job.subscriptionsFound,
+            potentialSavings: job.potentialSavings,
+            detectedSubscriptions: job.results
+          } : null
+        }
+      });
+    }
+    
+    // 全サブスクリプション一覧
+    const subscriptions = await prisma.subscription.findMany({
+      where: { userId: user.id },
+      include: {
+        creditCard: { select: { name: true, issuer: true, lastDigits: true } }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+    
+    const summary = {
+      totalMonthly: subscriptions
+        .filter(sub => sub.billingCycle === 'MONTHLY' && sub.status === 'ACTIVE')
+        .reduce((sum, sub) => sum + sub.amount, 0),
+      totalYearly: subscriptions
+        .filter(sub => sub.billingCycle === 'YEARLY' && sub.status === 'ACTIVE')
+        .reduce((sum, sub) => sum + sub.amount, 0),
+      activeCount: subscriptions.filter(sub => sub.status === 'ACTIVE').length,
+      potentialSavings: calculatePotentialSavings(subscriptions)
+    };
+    
+    return NextResponse.json({
+      success: true,
+      data: {
+        summary,
+        subscriptions: subscriptions.map(sub => ({
+          id: sub.id,
+          serviceName: sub.serviceName,
+          planName: sub.planName,
+          amount: sub.amount,
+          currency: sub.currency,
+          billingCycle: sub.billingCycle,
+          nextBillingDate: sub.nextBillingDate,
+          status: sub.status,
+          detectionMethod: sub.detectionMethod,
+          usageMemo: sub.usageMemo,
+          creditCard: sub.creditCard,
+          learningStatus: {
+            improving: sub.detectionMethod === 'AUTO' && sub.confidenceScore < 0.9,
+            message: sub.detectionMethod === 'AUTO' && sub.confidenceScore < 0.9 
+              ? 'パターン学習中...' 
+              : null
+          }
+        }))
+      }
+    });
+  } catch (error) {
+    return handleApiError(error);
+  }
+}
+```
+
+### 8.2 サブスク節約分析
+```typescript
+// app/api/subscriptions/analytics/route.ts
+export async function GET(req: NextRequest) {
+  try {
+    const user = await requireAuth(req);
+    
+    const subscriptions = await prisma.subscription.findMany({
+      where: { userId: user.id }
+    });
+    
+    // 使用頻度分析
+    const usageAnalysis = subscriptions.map(sub => {
+      const lastUsedDays = sub.lastTransactionId ? 
+        calculateDaysSinceLastUse(sub.lastTransactionId) : null;
+      
+      let usageScore = 'unknown';
+      if (lastUsedDays !== null) {
+        if (lastUsedDays <= 7) usageScore = 'high';
+        else if (lastUsedDays <= 30) usageScore = 'medium';
+        else usageScore = 'low';
+      }
+      
+      return {
+        ...sub,
+        lastUsedDays,
+        usageScore,
+        monthlyCost: sub.billingCycle === 'MONTHLY' ? sub.amount : Math.round(sub.amount / 12),
+        yearlyCost: sub.billingCycle === 'YEARLY' ? sub.amount : sub.amount * 12
+      };
+    });
+    
+    // 節約提案
+    const savingOpportunities = usageAnalysis
+      .filter(sub => sub.usageScore === 'low' || sub.status === 'PAUSED')
+      .map(sub => ({
+        subscriptionId: sub.id,
+        serviceName: sub.serviceName,
+        recommendation: sub.usageScore === 'low' ? 'CANCEL' : 'REVIEW',
+        potentialMonthlySaving: sub.monthlyCost,
+        potentialYearlySaving: sub.yearlyCost,
+        reason: sub.usageScore === 'low' 
+          ? `${sub.lastUsedDays}日間未使用`
+          : 'プラン見直しを検討'
+      }))
+      .sort((a, b) => b.potentialYearlySaving - a.potentialYearlySaving);
+    
+    return NextResponse.json({
+      success: true,
+      data: {
+        totalAnalyzed: subscriptions.length,
+        totalMonthlyCost: usageAnalysis.reduce((sum, sub) => sum + sub.monthlyCost, 0),
+        totalYearlyCost: usageAnalysis.reduce((sum, sub) => sum + sub.yearlyCost, 0),
+        usageBreakdown: {
+          high: usageAnalysis.filter(s => s.usageScore === 'high').length,
+          medium: usageAnalysis.filter(s => s.usageScore === 'medium').length,
+          low: usageAnalysis.filter(s => s.usageScore === 'low').length,
+          unknown: usageAnalysis.filter(s => s.usageScore === 'unknown').length
+        },
+        savingOpportunities,
+        maxPotentialSaving: {
+          monthly: savingOpportunities.reduce((sum, opp) => sum + opp.potentialMonthlySaving, 0),
+          yearly: savingOpportunities.reduce((sum, opp) => sum + opp.potentialYearlySaving, 0)
+        }
+      }
+    });
+  } catch (error) {
+    return handleApiError(error);
+  }
+}
+```
+
+## 9. ダッシュボードAPI
+
+### 9.1 統計データ
+```typescript
+// app/api/dashboard/stats/route.ts
+export async function GET(req: NextRequest) {
+  try {
+    const user = await requireAuth(req);
+    const { searchParams } = new URL(req.url);
+    const period = searchParams.get('period') || 'month'; // week, month, quarter, year
+    
+    const dateRange = getDateRangeForPeriod(period, user.monthStartDay);
+    
+    // 基本統計
+    const [transactionStats, subscriptionStats, categoryStats] = await Promise.all([
+      // 取引統計
+      prisma.transaction.aggregate({
+        where: {
+          userId: user.id,
+          transactionDate: {
+            gte: dateRange.start,
+            lte: dateRange.end
+          }
+        },
+        _sum: { amount: true },
+        _count: true,
+        _avg: { amount: true }
+      }),
+      
+      // サブスク統計
+      prisma.subscription.aggregate({
+        where: {
+          userId: user.id,
+          status: 'ACTIVE'
+        },
+        _sum: { amount: true },
+        _count: true
+      }),
+      
+      // カテゴリ別統計
+      prisma.transaction.groupBy({
+        by: ['categoryId'],
+        where: {
+          userId: user.id,
+          transactionDate: {
+            gte: dateRange.start,
+            lte: dateRange.end
+          }
+        },
+        _sum: { amount: true },
+        orderBy: { _sum: { amount: 'desc' } },
+        take: 5
+      })
+    ]);
+    
+    // 前期間との比較
+    const previousPeriodRange = getPreviousPeriodRange(period, user.monthStartDay);
+    const previousStats = await prisma.transaction.aggregate({
+      where: {
+        userId: user.id,
+        transactionDate: {
+          gte: previousPeriodRange.start,
+          lte: previousPeriodRange.end
+        }
+      },
+      _sum: { amount: true },
+      _count: true
+    });
+    
+    // チャートデータ生成
+    const chartData = await generateChartData(user.id, dateRange, period);
+    
+    // アラート生成
+    const alerts = await generateSubscriptionAlerts(user.id);
+    
+    // 最近の取引
+    const recentTransactions = await prisma.transaction.findMany({
+      where: { userId: user.id },
+      include: {
+        category: { select: { name: true, icon: true, color: true } },
+        creditCard: { select: { name: true, issuer: true, lastDigits: true } }
+      },
+      orderBy: { transactionDate: 'desc' },
+      take: 5
+    });
+    
+    return NextResponse.json({
+      success: true,
+      data: {
+        period,
+        dateRange,
+        summary: {
+          totalExpenses: transactionStats._sum.amount || 0,
+          transactionCount: transactionStats._count,
+          averageTransaction: Math.round(transactionStats._avg.amount || 0),
+          activeSubscriptions: subscriptionStats._count,
+          monthlySubscriptionCost: calculateMonthlySubscriptionCost(subscriptionStats._sum.amount || 0)
+        },
+        comparison: {
+          expenseChange: calculatePercentageChange(
+            transactionStats._sum.amount || 0,
+            previousStats._sum.amount || 0
+          ),
+          transactionChange: calculatePercentageChange(
+            transactionStats._count,
+            previousStats._count
+          )
+        },
+        charts: {
+          timeline: chartData.timeline,
+          categories: await formatCategoryChartData(categoryStats),
+          subscriptions: chartData.subscriptions
+        },
+        alerts,
+        recentTransactions: recentTransactions.map(formatTransactionResponse)
+      }
+    });
+  } catch (error) {
+    return handleApiError(error);
+  }
+}
+
+// チャートデータ生成
+async function generateChartData(userId: string, dateRange: DateRange, period: string) {
+  const timelineData = await prisma.transaction.groupBy({
+    by: ['transactionDate'],
+    where: {
+      userId,
+      transactionDate: {
+        gte: dateRange.start,
+        lte: dateRange.end
+      }
+    },
+    _sum: { amount: true },
+    orderBy: { transactionDate: 'asc' }
+  });
+  
+  const subscriptionData = await prisma.subscription.findMany({
+    where: {
+      userId,
+      status: 'ACTIVE'
+    },
+    select: {
+      serviceName: true,
+      amount: true,
+      billingCycle: true
+    }
+  });
+  
+  return {
+    timeline: formatTimelineData(timelineData, period),
+    subscriptions: formatSubscriptionChartData(subscriptionData)
+  };
+}
+
+// アラート生成
+async function generateSubscriptionAlerts(userId: string): Promise<SubscriptionAlert[]> {
+  const subscriptions = await prisma.subscription.findMany({
+    where: { userId, status: 'ACTIVE' }
+  });
+  
+  const alerts: SubscriptionAlert[] = [];
+  
+  for (const sub of subscriptions) {
+    // 高額サブスク警告
+    if (sub.amount > 3000) {
+      alerts.push({
+        id: sub.id,
+        type: 'expensive',
+        serviceName: sub.serviceName,
+        message: `月額${sub.amount.toLocaleString()}円の高額なサブスクリプションです`,
+        severity: 'medium',
+        action: 'プラン変更を検討'
+      });
+    }
+    
+    // 長期未使用警告（ここでは簡易的に実装）
+    const lastUsed = await getLastUsageDate(sub.id);
+    if (lastUsed && (Date.now() - lastUsed.getTime()) > 30 * 24 * 60 * 60 * 1000) {
+      alerts.push({
+        id: sub.id,
+        type: 'unused',
+        serviceName: sub.serviceName,
+        message: '30日以上使用されていません',
+        severity: 'high',
+        action: '解約を検討'
+      });
+    }
+  }
+  
+  return alerts.sort((a, b) => 
+    (b.severity === 'high' ? 2 : b.severity === 'medium' ? 1 : 0) -
+    (a.severity === 'high' ? 2 : a.severity === 'medium' ? 1 : 0)
+  );
+}
+```
+
+## 10. Webhook・外部連携API
+
+### 10.1 Stripe Webhook
+```typescript
+// app/api/webhooks/stripe/route.ts
+import { headers } from 'next/headers';
+import Stripe from 'stripe';
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: '2023-10-16'
+});
+
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.text();
+    const signature = headers().get('stripe-signature');
+    
+    if (!signature) {
+      throw new ApiError('MISSING_SIGNATURE', '署名が見つかりません', 400);
+    }
+    
+    // Webhook署名検証
+    const event = stripe.webhooks.constructEvent(
+      body,
+      signature,
+      process.env.STRIPE_WEBHOOK_SECRET!
+    );
+    
+    // ログ保存
+    await prisma.stripeWebhookLog.create({
+      data: {
+        stripeEventId: event.id,
+        eventType: event.type,
+        data: event.data as any,
+        processed: false
+      }
+    });
+    
+    // イベント処理
+    switch (event.type) {
+      case 'customer.subscription.created':
+      case 'customer.subscription.updated':
+        await handleSubscriptionChange(event);
+        break;
+        
+      case 'customer.subscription.deleted':
+        await handleSubscriptionCanceled(event);
+        break;
+        
+      case 'invoice.payment_succeeded':
+        await handlePaymentSucceeded(event);
+        break;
+        
+      case 'invoice.payment_failed':
+        await handlePaymentFailed(event);
+        break;
+        
+      default:
+        console.log(`未処理のイベントタイプ: ${event.type}`);
+    }
+    
+    // 処理完了をマーク
+    await prisma.stripeWebhookLog.updateMany({
+      where: { stripeEventId: event.id },
+      data: { processed: true }
+    });
+    
+    return NextResponse.json({ received: true });
+  } catch (error) {
+    console.error('Stripe webhook error:', error);
+    return handleApiError(error);
+  }
+}
+
+// サブスクリプション変更処理
+async function handleSubscriptionChange(event: Stripe.Event) {
+  const subscription = event.data.object as Stripe.Subscription;
+  const customerId = subscription.customer as string;
+  
+  // カスタマーIDからユーザーを特定
+  const user = await prisma.user.findFirst({
+    where: { subscriptionId: subscription.id }
+  });
+  
+  if (!user) {
+    console.error('ユーザーが見つかりません:', subscription.id);
+    return;
+  }
+  
+  // プラン情報を更新
+  const planType = determinePlanType(subscription);
+  
+  await prisma.user.update({
+    where: { id: user.id },
+    data: {
+      plan: planType,
+      subscriptionId: subscription.id
+    }
+  });
+  
+  console.log(`ユーザー ${user.id} のプランを ${planType} に更新`);
+}
+
+// プラン判定
+function determinePlanType(subscription: Stripe.Subscription): PlanType {
+  const priceId = subscription.items.data[0]?.price.id;
+  
+  if (priceId === process.env.STRIPE_PRICE_STANDARD) return 'STANDARD';
+  if (priceId === process.env.STRIPE_PRICE_PRO) return 'PRO';
+  
+  return 'FREE';
+}
+```
+
+## 11. バックグラウンド処理API
+
+### 11.1 バックグラウンドジョブ管理
+```typescript
+// lib/background-jobs.ts
+interface BackgroundJob {
+  id: string;
+  type: 'EMAIL_SYNC' | 'SUBSCRIPTION_DETECTION';
+  userId: string;
+  status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+  progress: number;
+  data: any;
+  result?: any;
+  error?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+// Vercel環境での制約対応
+class BackgroundJobManager {
+  // Redis または Database でジョブ管理
+  async createJob(type: string, userId: string, data: any): Promise<BackgroundJob> {
+    const job = await prisma.backgroundJob.create({
+      data: {
+        type,
+        userId,
+        data,
+        status: 'PENDING',
+        progress: 0
+      }
+    });
+    
+    // 即座に処理開始（Vercel制限内で）
+    this.processJob(job.id);
+    
+    return job;
+  }
+  
+  async processJob(jobId: string) {
+    const job = await prisma.backgroundJob.findUnique({
+      where: { id: jobId }
+    });
+    
+    if (!job || job.status !== 'PENDING') return;
+    
+    try {
+      await prisma.backgroundJob.update({
+        where: { id: jobId },
+        data: { status: 'RUNNING' }
+      });
+      
+      let result;
+      switch (job.type) {
+        case 'EMAIL_SYNC':
+          result = await this.processEmailSync(job);
+          break;
+        case 'SUBSCRIPTION_DETECTION':
+          result = await this.processSubscriptionDetection(job);
+          break;
+      }
+      
+      await prisma.backgroundJob.update({
+        where: { id: jobId },
+        data: { 
+          status: 'COMPLETED',
+          progress: 100,
+          result
+        }
+      });
+      
+    } catch (error) {
+      await prisma.backgroundJob.update({
+        where: { id: jobId },
+        data: {
+          status: 'FAILED',
+          error: error.message
+        }
+      });
+    }
+  }
+  
+  // 段階的処理でVercelの15秒制限回避
+  async processEmailSync(job: BackgroundJob) {
+    const { emailAccountId, dateRange } = job.data;
+    const batchSize = 20; // 一度に処理する件数
+    
+    const emails = await fetchEmailsFromProvider(emailAccountId, dateRange);
+    const totalEmails = emails.length;
+    
+    let processed = 0;
+    const results = [];
+    
+    // バッチ処理
+    for (let i = 0; i < totalEmails; i += batchSize) {
+      const batch = emails.slice(i, i + batchSize);
+      const batchResults = await processEmailBatch(batch);
+      results.push(...batchResults);
+      
+      processed += batch.length;
+      const progress = Math.round((processed / totalEmails) * 100);
+      
+      // プログレス更新
+      await prisma.backgroundJob.update({
+        where: { id: job.id },
+        data: { progress }
+      });
+      
+      // 処理時間制限チェック（Vercel対応）
+      if (this.shouldYield()) {
+        // 次のバッチを新しいリクエストで処理
+        await this.scheduleNextBatch(job.id, i + batchSize);
+        return { processed, total: totalEmails, status: 'PARTIAL' };
+      }
+    }
+    
+    return {
+      processed: totalEmails,
+      total: totalEmails,
+      transactionsCreated: results.filter(r => r.success).length,
+      errors: results.filter(r => !r.success).length
+    };
+  }
+  
+  private shouldYield(): boolean {
+    // 実行時間が10秒を超えたら次のバッチに移行
+    return process.hrtime.bigint() - this.startTime > 10_000_000_000n;
+  }
+}
+
+export const jobManager = new BackgroundJobManager();
+```
+
+## 12. レート制限・キャッシュ戦略
+
+### 12.1 レート制限
+```typescript
+// lib/rate-limit.ts
+import { Ratelimit } from "@upstash/ratelimit";
+import { Redis } from "@upstash/redis";
+
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
+
+// API別レート制限設定
+const rateLimiters = {
+  auth: new Ratelimit({
+    redis,
+    limiter: Ratelimit.slidingWindow(10, "1 m"), // 1分間に10回
+  }),
+  
+  emailSync: new Ratelimit({
+    redis,
+    limiter: Ratelimit.slidingWindow(3, "1 h"), // 1時間に3回
+  }),
+  
+  api: new Ratelimit({
+    redis,
+    limiter: Ratelimit.slidingWindow(100, "1 m"), // 1分間に100回
+  })
+};
+
+export async function checkRateLimit(
+  type: keyof typeof rateLimiters,
+  identifier: string
+): Promise<{ success: boolean; limit: number; remaining: number; reset: Date }> {
+  const { success, limit, reset, remaining } = await rateLimiters[type].limit(identifier);
+  
+  return {
+    success,
+    limit,
+    remaining,
+    reset: new Date(reset)
+  };
+}
+
+// ミドルウェアでの使用例
+export async function rateLimitMiddleware(
+  req: NextRequest,
+  type: keyof typeof rateLimiters = 'api'
+) {
+  const ip = req.headers.get('x-forwarded-for') || 'anonymous';
+  const { success, limit, remaining, reset } = await checkRateLimit(type, ip);
+  
+  if (!success) {
+    return NextResponse.json({
+      success: false,
+      error: {
+        code: 'RATE_LIMIT_EXCEEDED',
+        message: 'リクエスト制限を超えました',
+        details: { limit, remaining, reset }
+      }
+    }, { status: 429 });
+  }
+  
+  return null; // 制限に引っかからなかった場合
+}
+```
+
+### 12.2 キャッシュ戦略
+```typescript
+// lib/cache.ts
+interface CacheConfig {
+  ttl: number; // seconds
+  staleWhileRevalidate?: number;
+  tags?: string[];
+}
+
+const cacheConfigs: Record<string, CacheConfig> = {
+  'user-profile': { ttl: 300 }, // 5分
+  'dashboard-stats': { ttl: 60, staleWhileRevalidate: 300 }, // 1分、5分間古いデータも許可
+  'transactions': { ttl: 30, tags: ['transactions'] },
+  'subscriptions': { ttl: 300, tags: ['subscriptions'] },
+  'categories': { ttl: 3600 } // 1時間
+};
+
+export async function getCached<T>(
+  key: string,
+  fetcher: () => Promise<T>,
+  config?: CacheConfig
+): Promise<T> {
+  const cacheConfig = config || cacheConfigs[key.split(':')[0]] || { ttl: 60 };
+  
+  try {
+    const cached = await redis.get(key);
+    if (cached) {
+      return JSON.parse(cached);
+    }
+  } catch (error) {
+    console.warn('Cache get error:', error);
+  }
+  
+  // キャッシュにない場合は新しく取得
+  const data = await fetcher();
+  
+  try {
+    await redis.setex(key, cacheConfig.ttl, JSON.stringify(data));
+  } catch (error) {
+    console.warn('Cache set error:', error);
+  }
+  
+  return data;
+}
+
+export async function invalidateCache(pattern: string) {
+  try {
+    const keys = await redis.keys(pattern);
+    if (keys.length > 0) {
+      await redis.del(...keys);
+    }
+  } catch (error) {
+    console.warn('Cache invalidation error:', error);
+  }
+}
+
+// 使用例
+export async function getCachedDashboardStats(userId: string) {
+  return getCached(
+    `dashboard:stats:${userId}`,
+    () => generateDashboardStats(userId),
+    cacheConfigs['dashboard-stats']
+  );
+}
+```
+
+---
+
+## 13. API使用例・統合テスト
+
+### 13.1 フロントエンドでの使用例
+```typescript
+// hooks/useTransactions.ts
+import useSWR from 'swr';
+
+interface UseTransactionsOptions {
+  page?: number;
+  limit?: number;
+  categoryId?: string;
+  creditCardId?: string;
+}
+
+export function useTransactions(options: UseTransactionsOptions = {}) {
+  const params = new URLSearchParams({
+    page: String(options.page || 1),
+    limit: String(options.limit || 20),
+    ...(options.categoryId && { categoryId: options.categoryId }),
+    ...(options.creditCardId && { creditCardId: options.creditCardId })
+  });
+  
+  const { data, error, mutate } = useSWR(
+    `/api/transactions?${params}`,
+    fetcher,
+    { revalidateOnFocus: false }
+  );
+  
+  return {
+    transactions: data?.data || [],
+    pagination: data?.meta?.pagination,
+    loading: !error && !data,
+    error,
+    refresh: mutate
+  };
+}
+
+// utils/api.ts
+export async function apiCall<T>(
+  endpoint: string,
+  options: RequestInit = {}
+): Promise<ApiSuccessResponse<T>> {
+  const response = await fetch(endpoint, {
+    headers: {
+      'Content-Type': 'application/json',
+      ...options.headers,
+    },
+    ...options,
+  });
+  
+  const data = await response.json();
+  
+  if (!data.success) {
+    throw new ApiError(data.error.code, data.error.message, response.status);
+  }
+  
+  return data;
+}
+```
+

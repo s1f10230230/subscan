@@ -1,0 +1,383 @@
+# データベース設計書
+
+## 1. データベース概要
+
+**使用技術：** PostgreSQL + Prisma ORM
+**デプロイ先：** Vercel PostgreSQL
+
+## 2. ER図概要
+
+```
+User (1) ---- (N) CreditCard
+User (1) ---- (N) EmailAccount  
+User (1) ---- (N) Transaction
+User (1) ---- (N) Subscription
+User (1) ---- (N) Category
+
+Transaction (N) ---- (1) Category
+Transaction (N) ---- (1) CreditCard
+Subscription (N) ---- (1) User
+EmailData (N) ---- (1) EmailAccount
+```
+
+## 3. テーブル設計
+
+### 3.1 User（ユーザー）
+```sql
+CREATE TABLE users (
+  id                String      PRIMARY KEY DEFAULT cuid()
+  email            String      UNIQUE NOT NULL
+  name             String?
+  image            String?
+  provider         String      NOT NULL -- 'google', 'yahoo'
+  provider_id      String      NOT NULL
+  plan             PlanType    DEFAULT 'FREE' -- 'FREE', 'STANDARD', 'PRO'
+  subscription_id  String?     -- Stripe subscription ID
+  month_start_day  Int         DEFAULT 1 -- 月の開始日（1-28）
+  timezone         String      DEFAULT 'Asia/Tokyo'
+  created_at       DateTime    DEFAULT now()
+  updated_at       DateTime    updatedAt
+  deleted_at       DateTime?
+)
+```
+
+### 3.2 EmailAccount（メールアカウント）
+```sql
+CREATE TABLE email_accounts (
+  id              String    PRIMARY KEY DEFAULT cuid()
+  user_id         String    NOT NULL REFERENCES users(id) ON DELETE CASCADE
+  email_address   String    NOT NULL
+  provider        String    NOT NULL -- 'gmail', 'yahoo'
+  access_token    String    NOT NULL -- 暗号化必須
+  refresh_token   String?   -- 暗号化必須
+  token_expires   DateTime?
+  is_active       Boolean   DEFAULT true
+  last_sync       DateTime?
+  created_at      DateTime  DEFAULT now()
+  updated_at      DateTime  updatedAt
+  
+  UNIQUE(user_id, email_address)
+)
+```
+
+### 3.3 CreditCard（クレジットカード）
+```sql
+CREATE TABLE credit_cards (
+  id           String      PRIMARY KEY DEFAULT cuid()
+  user_id      String      NOT NULL REFERENCES users(id) ON DELETE CASCADE
+  name         String      NOT NULL -- 'メインカード', '楽天カード'
+  brand        String      NOT NULL -- 'VISA', 'MasterCard', 'JCB'
+  issuer       String      NOT NULL -- '楽天', '三井住友', 'JCB'
+  last_digits  String      NOT NULL -- 下4桁
+  color        String      DEFAULT '#3B82F6' -- UI表示用
+  is_active    Boolean     DEFAULT true
+  created_at   DateTime    DEFAULT now()
+  updated_at   DateTime    updatedAt
+  
+  UNIQUE(user_id, issuer, last_digits)
+)
+```
+
+### 3.4 Category（カテゴリ）
+```sql
+CREATE TABLE categories (
+  id          String    PRIMARY KEY DEFAULT cuid()
+  user_id     String?   REFERENCES users(id) ON DELETE CASCADE -- NULLの場合システムデフォルト
+  name        String    NOT NULL
+  icon        String    DEFAULT '💳'
+  color       String    DEFAULT '#6B7280'
+  is_default  Boolean   DEFAULT false
+  sort_order  Int       DEFAULT 0
+  created_at  DateTime  DEFAULT now()
+  updated_at  DateTime  updatedAt
+  
+  UNIQUE(user_id, name)
+)
+
+-- デフォルトカテゴリのINSERT
+INSERT INTO categories (name, icon, color, is_default) VALUES
+('食費', '🍽️', '#EF4444', true),
+('交通費', '🚃', '#3B82F6', true),
+('エンタメ', '🎬', '#8B5CF6', true),
+('サブスクリプション', '💳', '#F59E0B', true),
+('生活費', '🏠', '#10B981', true),
+('医療費', '🏥', '#EC4899', true),
+('その他', '📦', '#6B7280', true);
+```
+
+### 3.5 Transaction（取引履歴）
+```sql
+CREATE TABLE transactions (
+  id              String       PRIMARY KEY DEFAULT cuid()
+  user_id         String       NOT NULL REFERENCES users(id) ON DELETE CASCADE
+  credit_card_id  String       NOT NULL REFERENCES credit_cards(id) ON DELETE CASCADE
+  category_id     String       NOT NULL REFERENCES categories(id)
+  amount          Int          NOT NULL -- 円単位で保存
+  currency        String       DEFAULT 'JPY'
+  exchange_rate   Decimal(10,4)? -- 外貨の場合のレート
+  merchant_name   String       NOT NULL -- 店舗名
+  description     String?      -- メモ
+  transaction_date DateTime    NOT NULL -- 取引日
+  source          SourceType   DEFAULT 'MANUAL' -- 'EMAIL', 'MANUAL'
+  email_data_id   String?      REFERENCES email_data(id)
+  is_verified     Boolean      DEFAULT false -- ユーザーが確認済みか
+  created_at      DateTime     DEFAULT now()
+  updated_at      DateTime     updatedAt
+  
+  INDEX(user_id, transaction_date)
+  INDEX(credit_card_id, transaction_date)
+)
+```
+
+### 3.6 Subscription（サブスクリプション）
+```sql
+CREATE TABLE subscriptions (
+  id                String         PRIMARY KEY DEFAULT cuid()
+  user_id           String         NOT NULL REFERENCES users(id) ON DELETE CASCADE
+  credit_card_id    String?        REFERENCES credit_cards(id)
+  service_name      String         NOT NULL -- 'Netflix', 'Spotify'
+  plan_name         String?        -- 'Premium', 'Family'
+  amount            Int            NOT NULL -- 円単位
+  currency          String         DEFAULT 'JPY'
+  billing_cycle     BillingCycle   NOT NULL -- 'MONTHLY', 'YEARLY'
+  next_billing_date DateTime?
+  status            SubStatus      DEFAULT 'ACTIVE' -- 'ACTIVE', 'CANCELED', 'PAUSED'
+  detection_method  DetectionType  DEFAULT 'AUTO' -- 'AUTO', 'MANUAL'
+  confidence_score  Decimal(3,2)?  -- 自動検出の信頼度（0.00-1.00）
+  usage_memo        String?        -- ユーザーが記入する利用状況
+  last_transaction_id String?      REFERENCES transactions(id)
+  created_at        DateTime       DEFAULT now()
+  updated_at        DateTime       updatedAt
+  
+  INDEX(user_id, status)
+  INDEX(next_billing_date)
+)
+```
+
+### 3.7 EmailData（メールデータ）
+```sql
+CREATE TABLE email_data (
+  id                String    PRIMARY KEY DEFAULT cuid()
+  email_account_id  String    NOT NULL REFERENCES email_accounts(id) ON DELETE CASCADE
+  message_id        String    NOT NULL -- メールプロバイダーのメッセージID
+  subject           String    NOT NULL
+  sender            String    NOT NULL
+  received_at       DateTime  NOT NULL
+  extracted_amount  Int?      -- 抽出した金額（円単位）
+  extracted_currency String?  -- 抽出した通貨コード
+  merchant_name     String?   -- 抽出した店舗名
+  processed         Boolean   DEFAULT false
+  processed_at      DateTime?
+  created_at        DateTime  DEFAULT now()
+  
+  UNIQUE(email_account_id, message_id)
+  INDEX(email_account_id, received_at)
+)
+
+-- 注意: 本文は解析時のみ使用し、データベースには保存しない
+-- セキュリティとプライバシー保護のため
+```
+
+### 3.8 SubscriptionPattern（サブスク検出パターン）
+```sql
+CREATE TABLE subscription_patterns (
+  id            String    PRIMARY KEY DEFAULT cuid()
+  service_name  String    NOT NULL
+  sender_pattern String   NOT NULL -- 正規表現
+  subject_pattern String  NOT NULL -- 正規表現
+  amount_pattern String?  -- 金額抽出用正規表現
+  currency      String    DEFAULT 'JPY'
+  billing_cycle BillingCycle DEFAULT 'MONTHLY'
+  confidence    Decimal(3,2) DEFAULT 0.90 -- このパターンの信頼度
+  is_active     Boolean   DEFAULT true
+  created_at    DateTime  DEFAULT now()
+  updated_at    DateTime  updatedAt
+  
+  UNIQUE(service_name, sender_pattern)
+)
+
+-- 初期パターンデータ
+INSERT INTO subscription_patterns (service_name, sender_pattern, subject_pattern, amount_pattern) VALUES
+('Netflix', 'noreply@account\.netflix\.com', 'お支払いのお知らせ|Payment confirmation', '¥?([0-9,]+)'),
+('Spotify', 'noreply@spotify\.com', 'Premium|お支払い', '\$([0-9.]+)|¥([0-9,]+)'),
+('Amazon Prime', 'account-update@amazon\.co\.jp', 'プライム会員|Prime membership', '¥([0-9,]+)'),
+('Adobe Creative Cloud', 'message\.adobe\.com', 'Creative Cloud|お支払い完了', '¥([0-9,]+)|\$([0-9.]+)');
+```
+
+## 4. Enum定義
+
+```typescript
+enum PlanType {
+  FREE
+  STANDARD  
+  PRO
+}
+
+enum SourceType {
+  EMAIL
+  MANUAL
+}
+
+enum BillingCycle {
+  MONTHLY
+  YEARLY
+  WEEKLY
+}
+
+enum SubStatus {
+  ACTIVE
+  CANCELED
+  PAUSED
+}
+
+enum DetectionType {
+  AUTO
+  MANUAL
+}
+```
+
+## 5. インデックス設計
+
+### 5.1 パフォーマンス重視のインデックス
+- `transactions`: (user_id, transaction_date DESC)
+- `subscriptions`: (user_id, status, next_billing_date)
+- `email_data`: (email_account_id, received_at DESC)
+
+### 5.2 複合インデックス
+- `transactions`: (user_id, category_id, transaction_date)
+- `subscriptions`: (user_id, credit_card_id, status)
+
+### 5.9 UserActivityLog（ユーザーアクティビティログ）
+```sql
+CREATE TABLE user_activity_logs (
+  id          String      PRIMARY KEY DEFAULT cuid()
+  user_id     String      NOT NULL REFERENCES users(id) ON DELETE CASCADE
+  action      String      NOT NULL -- 'login', 'email_sync', 'transaction_add'
+  details     Json?       -- 追加詳細情報
+  ip_address  String?
+  user_agent  String?
+  created_at  DateTime    DEFAULT now()
+  
+  INDEX(user_id, created_at)
+)
+```
+
+### 5.10 EmailProcessingError（メール解析エラーログ）
+```sql
+CREATE TABLE email_processing_errors (
+  id              String    PRIMARY KEY DEFAULT cuid()
+  email_data_id   String    NOT NULL REFERENCES email_data(id) ON DELETE CASCADE
+  error_type      String    NOT NULL -- 'AMOUNT_EXTRACTION_FAILED', 'MERCHANT_PARSING_FAILED'
+  error_message   String    NOT NULL
+  email_subject   String    NOT NULL -- デバッグ用
+  email_sender    String    NOT NULL -- デバッグ用
+  created_at      DateTime  DEFAULT now()
+  
+  INDEX(error_type, created_at)
+)
+```
+
+### 5.11 StripeWebhookLog（課金履歴）
+```sql
+CREATE TABLE stripe_webhook_logs (
+  id               String    PRIMARY KEY DEFAULT cuid()
+  stripe_event_id  String    NOT NULL UNIQUE
+  event_type       String    NOT NULL -- 'customer.subscription.created'
+  user_id          String?   REFERENCES users(id) ON DELETE SET NULL
+  processed        Boolean   DEFAULT false
+  data             Json      NOT NULL -- Stripeイベントデータ
+  created_at       DateTime  DEFAULT now()
+  
+  INDEX(event_type, created_at)
+  INDEX(user_id, created_at)
+)
+```
+
+### 6.1 暗号化が必要なフィールド
+- `email_accounts.access_token`
+- `email_accounts.refresh_token` 
+
+### 6.2 データ処理フロー
+- **メール本文**: API取得時のみ使用、解析後は破棄
+- **抽出データ**: 金額・通貨・店舗名のみデータベース保存
+- **プライバシー**: メール本文の永続化は行わない
+
+### 6.2 データ保持ポリシー
+- **無料版**: 手動入力データは永続保存、メールデータなし
+- **有料版**: メールデータ3ヶ月保持
+- **Pro版**: メールデータ1年保持
+- **退会時**: 30日後に全データ削除
+
+## 7. Prismaスキーマサンプル
+
+```prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id              String         @id @default(cuid())
+  email           String         @unique
+  name            String?
+  image           String?
+  provider        String
+  providerId      String         @map("provider_id")
+  plan            PlanType       @default(FREE)
+  subscriptionId  String?        @map("subscription_id")
+  monthStartDay   Int            @default(1) @map("month_start_day")
+  timezone        String         @default("Asia/Tokyo")
+  createdAt       DateTime       @default(now()) @map("created_at")
+  updatedAt       DateTime       @updatedAt @map("updated_at")
+  deletedAt       DateTime?      @map("deleted_at")
+  
+  creditCards     CreditCard[]
+  emailAccounts   EmailAccount[]
+  transactions    Transaction[]
+  subscriptions   Subscription[]
+  categories      Category[]
+  
+  @@map("users")
+}
+
+enum PlanType {
+  FREE
+  STANDARD
+  PRO
+}
+
+enum SourceType {
+  EMAIL
+  MANUAL
+}
+
+enum BillingCycle {
+  MONTHLY
+  YEARLY
+  WEEKLY
+}
+
+enum SubStatus {
+  ACTIVE
+  CANCELED
+  PAUSED
+}
+
+enum DetectionType {
+  AUTO
+  MANUAL
+}
+```
+
+---
+
+このデータベース設計で問題ないか確認してください。特に：
+1. テーブル構成の過不足
+2. 外部キー制約の妥当性
+3. インデックス設計の適切性
+4. セキュリティ要件の充足性
+

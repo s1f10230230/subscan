@@ -1,0 +1,221 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                      String         @id @default(cuid())
+  email                   String         @unique
+  name                    String?
+  image                   String?
+  provider                String
+  providerId              String         @map("provider_id")
+  plan                    String         @default("FREE") // FREE, STANDARD, PRO
+  stripeCustomerId        String?        @unique @map("stripe_customer_id")
+  stripeSubscriptionId    String?        @unique @map("stripe_subscription_id")
+  subscriptionStatus      String?        @default("inactive") @map("subscription_status") // active, canceled, past_due, etc.
+  subscriptionEndsAt      DateTime?      @map("subscription_ends_at")
+  monthStartDay           Int            @default(1) @map("month_start_day")
+  timezone                String         @default("Asia/Tokyo")
+  createdAt               DateTime       @default(now()) @map("created_at")
+  updatedAt               DateTime       @updatedAt @map("updated_at")
+  deletedAt               DateTime?      @map("deleted_at")
+
+  creditCards     CreditCard[]
+  emailAccounts   EmailAccount[]
+  transactions    Transaction[]
+  subscriptions   Subscription[]
+  categories      Category[]
+  activityLogs    UserActivityLog[]
+
+  @@map("users")
+}
+
+model EmailAccount {
+  id             String    @id @default(cuid())
+  userId         String    @map("user_id")
+  emailAddress   String    @map("email_address")
+  provider       String
+  accessToken    String    @map("access_token")
+  refreshToken   String?   @map("refresh_token")
+  tokenExpires   DateTime? @map("token_expires")
+  isActive       Boolean   @default(true) @map("is_active")
+  lastSync       DateTime? @map("last_sync")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  emailData      EmailData[]
+
+  @@unique([userId, emailAddress])
+  @@map("email_accounts")
+}
+
+model CreditCard {
+  id           String      @id @default(cuid())
+  userId       String      @map("user_id")
+  name         String
+  brand        String
+  issuer       String
+  lastDigits   String      @map("last_digits")
+  color        String      @default("#3B82F6")
+  isActive     Boolean     @default(true) @map("is_active")
+  createdAt    DateTime    @default(now()) @map("created_at")
+  updatedAt    DateTime    @updatedAt @map("updated_at")
+
+  user         User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions Transaction[]
+  subscriptions Subscription[]
+
+  @@unique([userId, issuer, lastDigits])
+  @@map("credit_cards")
+}
+
+model Category {
+  id          String    @id @default(cuid())
+  userId      String?   @map("user_id")
+  name        String
+  icon        String    @default("💳")
+  color       String    @default("#6B7280")
+  isDefault   Boolean   @default(false) @map("is_default")
+  sortOrder   Int       @default(0) @map("sort_order")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  user        User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions Transaction[]
+
+  @@map("categories")
+}
+
+model Transaction {
+  id             String       @id @default(cuid())
+  userId         String       @map("user_id")
+  creditCardId   String       @map("credit_card_id")
+  categoryId     String       @map("category_id")
+  amount         Int
+  currency       String       @default("JPY")
+  exchangeRate   Float?       @map("exchange_rate") // SQLiteではFloatを使用
+  merchantName   String       @map("merchant_name")
+  description    String?
+  transactionDate DateTime    @map("transaction_date")
+  source         String       @default("MANUAL") // SQLiteではenumをStringで代用
+  emailDataId    String?      @map("email_data_id")
+  isVerified     Boolean      @default(false) @map("is_verified")
+  createdAt      DateTime     @default(now()) @map("created_at")
+  updatedAt      DateTime     @updatedAt @map("updated_at")
+
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  creditCard     CreditCard   @relation(fields: [creditCardId], references: [id], onDelete: Cascade)
+  category       Category     @relation(fields: [categoryId], references: [id])
+  emailData      EmailData?   @relation(fields: [emailDataId], references: [id])
+
+  @@map("transactions")
+}
+
+model Subscription {
+  id                String         @id @default(cuid())
+  userId            String         @map("user_id")
+  creditCardId      String?        @map("credit_card_id")
+  serviceName       String         @map("service_name")
+  planName          String?        @map("plan_name")
+  amount            Int
+  currency          String         @default("JPY")
+  billingCycle      String         @map("billing_cycle") // SQLiteではenumをStringで代用
+  nextBillingDate   DateTime?      @map("next_billing_date")
+  status            String         @default("ACTIVE") // SQLiteではenumをStringで代用
+  detectionMethod   String         @default("AUTO") @map("detection_method")
+  confidenceScore   Float?         @map("confidence_score") // SQLiteではFloatを使用
+  usageMemo         String?        @map("usage_memo")
+  lastTransactionId String?        @map("last_transaction_id")
+  createdAt         DateTime       @default(now()) @map("created_at")
+  updatedAt         DateTime       @updatedAt @map("updated_at")
+
+  user              User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  creditCard        CreditCard?    @relation(fields: [creditCardId], references: [id])
+
+  @@map("subscriptions")
+}
+
+model EmailData {
+  id                String    @id @default(cuid())
+  emailAccountId    String    @map("email_account_id")
+  messageId         String    @map("message_id")
+  subject           String
+  sender            String
+  receivedAt        DateTime  @map("received_at")
+  extractedAmount   Int?      @map("extracted_amount")
+  extractedCurrency String?   @map("extracted_currency")
+  merchantName      String?   @map("merchant_name")
+  processed         Boolean   @default(false)
+  processedAt       DateTime? @map("processed_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+
+  emailAccount      EmailAccount @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
+  transactions      Transaction[]
+  processingErrors  EmailProcessingError[]
+
+  @@unique([emailAccountId, messageId])
+  @@map("email_data")
+}
+
+model SubscriptionPattern {
+  id             String       @id @default(cuid())
+  serviceName    String       @map("service_name")
+  senderPattern  String       @map("sender_pattern")
+  subjectPattern String       @map("subject_pattern")
+  amountPattern  String?      @map("amount_pattern")
+  currency       String       @default("JPY")
+  billingCycle   String       @default("MONTHLY") @map("billing_cycle")
+  confidence     Float        @default(0.90)
+  isActive       Boolean      @default(true) @map("is_active")
+  createdAt      DateTime     @default(now()) @map("created_at")
+  updatedAt      DateTime     @updatedAt @map("updated_at")
+
+  @@unique([serviceName, senderPattern])
+  @@map("subscription_patterns")
+}
+
+model UserActivityLog {
+  id         String   @id @default(cuid())
+  userId     String   @map("user_id")
+  action     String
+  details    String?  // SQLiteではJsonをStringで代用
+  ipAddress  String?  @map("ip_address")
+  userAgent  String?  @map("user_agent")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_activity_logs")
+}
+
+model EmailProcessingError {
+  id           String    @id @default(cuid())
+  emailDataId  String    @map("email_data_id")
+  errorType    String    @map("error_type")
+  errorMessage String    @map("error_message")
+  emailSubject String    @map("email_subject")
+  emailSender  String    @map("email_sender")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  emailData    EmailData @relation(fields: [emailDataId], references: [id], onDelete: Cascade)
+
+  @@map("email_processing_errors")
+}
+
+model StripeWebhookLog {
+  id             String   @id @default(cuid())
+  stripeEventId  String   @unique @map("stripe_event_id")
+  eventType      String   @map("event_type")
+  userId         String?  @map("user_id")
+  processed      Boolean  @default(false)
+  data           String   // SQLiteではJsonをStringで代用
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@map("stripe_webhook_logs")
+}
