@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getServerSession } from 'next-auth/next'
 import { authOptions } from '@/lib/auth'
+
+// Force dynamic rendering
+export const dynamic = 'force-dynamic'
 import { prisma } from '@/lib/prisma'
 import { createGmailClient, extractTransactionFromEmail, logEmailProcessingError } from '@/lib/email/gmail'
 

@@ -3,6 +3,9 @@ import { getServerSession } from 'next-auth/next'
 import { authOptions } from '@/lib/auth'
 import { prisma } from '@/lib/prisma'
 import { encrypt, decrypt } from '@/lib/encryption'
+
+// Force dynamic rendering
+export const dynamic = 'force-dynamic'
 import { getGmailClientForUser, createGmailClient } from '@/lib/email/gmail'
 import { z } from 'zod'
 
