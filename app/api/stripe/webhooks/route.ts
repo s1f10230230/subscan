@@ -10,6 +10,10 @@ export const dynamic = 'force-dynamic'
 const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET!
 
 export async function POST(request: NextRequest) {
+  if (!stripe) {
+    return NextResponse.json({ error: 'Stripe not configured' }, { status: 500 })
+  }
+
   const body = await request.text()
   const sig = headers().get('stripe-signature')!
 
