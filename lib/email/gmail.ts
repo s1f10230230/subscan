@@ -260,11 +260,12 @@ export function extractTransactionFromEmail(message: GmailMessage): {
     const match = content.match(pattern)
     if (match) {
       const amountStr = match[1].replace(/,/g, '')
-      extractedAmount = parseInt(amountStr, 10)
-
+      // 主要単位で保持（JPYは整数化、USD等は小数維持）
       if (pattern.source.includes('$')) {
         currency = 'USD'
-        extractedAmount = Math.round(extractedAmount * 100) // セント単位に変換
+        extractedAmount = Math.round(parseFloat(amountStr) * 100) / 100
+      } else {
+        extractedAmount = Math.round(parseFloat(amountStr))
       }
       break
     }

@@ -13,9 +13,9 @@ export default withAuth(
         // 公開ページ（認証不要）
         const publicPaths = [
           '/',
-          '/auth/signin',
-          '/auth/signup',
-          '/auth/error',
+          '/signin',
+          '/signup',
+          '/error',
           '/privacy',
           '/terms',
           '/pricing',
@@ -49,7 +49,7 @@ export default withAuth(
       },
     },
     pages: {
-      signIn: "/auth/signin",
+      signIn: "/signin",
     },
   }
 )

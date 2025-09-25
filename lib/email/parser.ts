@@ -419,13 +419,16 @@ export class EmailParser {
 
     // 送信者のドメインから推測
     if (sender) {
-      const emailMatch = sender.match(/@([^.]+)/);
-      if (emailMatch) {
-        const domain = emailMatch[1].replace(/[-_]/g, ' ');
-        if (domain && domain.length > 2) {
+      // 送信者メールのドメインからサービス名を推測（第二レベルドメインを優先）
+      const domainMatch = sender.match(/@([^>\s]+)/);
+      if (domainMatch) {
+        const parts = domainMatch[1].split('.');
+        const core = parts.length >= 2 ? parts[parts.length - 2] : parts[0];
+        const name = core.replace(/[-_]/g, ' ');
+        if (name && name.length > 2) {
           return {
             success: true,
-            merchantName: domain.charAt(0).toUpperCase() + domain.slice(1).substring(0, 49)
+            merchantName: name.charAt(0).toUpperCase() + name.slice(1).substring(0, 49)
           };
         }
       }

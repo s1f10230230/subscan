@@ -411,10 +411,12 @@ export function normalizeAmount(amountStr: string, currency: string): number {
     throw new Error(`Invalid amount format: ${amountStr}`);
   }
 
-  // USD等の場合、セント単位に変換
-  if (currency === 'USD' || currency === 'EUR') {
-    return Math.round(amount * 100);
+  // 解析結果は通貨の「主要単位」で返す
+  // 例) JPY: 1490, USD: 9.99, EUR: 12.5
+  if (currency === 'JPY') {
+    return Math.round(amount);
   }
 
-  return Math.round(amount);
+  // 非JPYは小数第2位までに丸めて返す（表示/後段での換算を想定）
+  return Math.round(amount * 100) / 100;
 }

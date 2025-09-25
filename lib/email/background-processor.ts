@@ -297,7 +297,8 @@ export class EmailBackgroundProcessor {
         userId,
         creditCardId: defaultCard?.id,
         serviceName: result.data!.serviceName!,
-        amount: result.data!.amount,
+        // DBはInt想定のため保存時に丸める
+        amount: Math.round(result.data!.amount),
         currency: result.data!.currency,
         billingCycle: result.data!.billingCycle as any,
         detectionMethod: 'AUTO',
@@ -333,7 +334,8 @@ export class EmailBackgroundProcessor {
         userId,
         creditCardId: defaultCard.id,
         categoryId: defaultCategory.id,
-        amount: result.data!.amount,
+        // DBはInt想定のため保存時に丸める
+        amount: Math.round(result.data!.amount),
         currency: result.data!.currency,
         merchantName: result.data!.merchantName,
         transactionDate: new Date(email.date),
