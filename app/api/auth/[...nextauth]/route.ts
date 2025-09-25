@@ -1,8 +1,7 @@
 import NextAuth from "next-auth"
 import { authOptions } from "@/lib/auth"
 
-// Force dynamic rendering for this route
-export const runtime = 'nodejs'
+// Force dynamic rendering to fix cookies context error
 export const dynamic = 'force-dynamic'
 
 const handler = NextAuth(authOptions)
