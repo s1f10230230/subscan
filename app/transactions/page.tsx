@@ -5,124 +5,17 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Button } from "@/components/ui/button"
 import Link from 'next/link'
 import { ArrowLeft, Filter, Search, Download, Calendar, Plus } from "lucide-react"
-import { canAddMonthlyTransaction, getPlanLimits } from '@/lib/plan'
+import { canAddMonthlyTransaction, getPlanLimits, isPlanLimitsDisabled } from '@/lib/plan'
+import { prisma } from '@/lib/prisma'
 
 // Force dynamic rendering
 export const dynamic = 'force-dynamic'
 
-// モックデータ
-const mockTransactions = [
-  {
-    id: 1,
-    date: '2024-03-15',
-    merchant: 'Amazon.co.jp',
-    amount: 2480,
-    category: '🛒',
-    categoryName: 'ショッピング',
-    card: '楽天カード',
-    type: 'PURCHASE',
-    status: 'CONFIRMED'
-  },
-  {
-    id: 2,
-    date: '2024-03-14',
-    merchant: 'Netflix',
-    amount: 1490,
-    category: '📺',
-    categoryName: 'エンタメ',
-    card: '楽天カード',
-    type: 'SUBSCRIPTION',
-    status: 'CONFIRMED'
-  },
-  {
-    id: 3,
-    date: '2024-03-14',
-    merchant: 'セブンイレブン',
-    amount: 384,
-    category: '🏪',
-    categoryName: 'コンビニ',
-    card: '楽天カード',
-    type: 'PURCHASE',
-    status: 'CONFIRMED'
-  },
-  {
-    id: 4,
-    date: '2024-03-13',
-    merchant: '楽天市場',
-    amount: 8900,
-    category: '🛍️',
-    categoryName: 'ショッピング',
-    card: '楽天カード',
-    type: 'PURCHASE',
-    status: 'CONFIRMED'
-  },
-  {
-    id: 5,
-    date: '2024-03-13',
-    merchant: 'Uber Eats',
-    amount: 1250,
-    category: '🍕',
-    categoryName: '食事・外食',
-    card: '楽天カード',
-    type: 'PURCHASE',
-    status: 'CONFIRMED'
-  },
-  {
-    id: 6,
-    date: '2024-03-12',
-    merchant: 'JR東日本',
-    amount: 280,
-    category: '🚃',
-    categoryName: '交通費',
-    card: '楽天カード',
-    type: 'PURCHASE',
-    status: 'CONFIRMED'
-  },
-  {
-    id: 7,
-    date: '2024-03-12',
-    merchant: 'Spotify',
-    amount: 980,
-    category: '🎵',
-    categoryName: 'エンタメ',
-    card: '楽天カード',
-    type: 'SUBSCRIPTION',
-    status: 'CONFIRMED'
-  },
-  {
-    id: 8,
-    date: '2024-03-11',
-    merchant: 'スターバックス',
-    amount: 540,
-    category: '☕',
-    categoryName: '食事・外食',
-    card: '楽天カード',
-    type: 'PURCHASE',
-    status: 'CONFIRMED'
-  },
-  {
-    id: 9,
-    date: '2024-03-10',
-    merchant: 'Amazon Prime',
-    amount: 500,
-    category: '📦',
-    categoryName: 'サブスク',
-    card: '楽天カード',
-    type: 'SUBSCRIPTION',
-    status: 'CONFIRMED'
-  },
-  {
-    id: 10,
-    date: '2024-03-09',
-    merchant: 'ファミリーマート',
-    amount: 158,
-    category: '🏪',
-    categoryName: 'コンビニ',
-    card: '楽天カード',
-    type: 'PURCHASE',
-    status: 'CONFIRMED'
-  }
-]
+function monthRange(d = new Date()) {
+  const start = new Date(d.getFullYear(), d.getMonth(), 1)
+  const next = new Date(d.getFullYear(), d.getMonth() + 1, 1)
+  return { start, end: next }
+}
 
 export default async function TransactionsPage() {
   const session = await getServerSession(authOptions)
@@ -156,10 +49,37 @@ export default async function TransactionsPage() {
     }
   }
 
-  const totalAmount = mockTransactions.reduce((sum, t) => sum + t.amount, 0)
+  const { start, end } = monthRange()
+  const rows = await prisma.transaction.findMany({
+    where: { userId: session.user!.id!, transactionDate: { gte: start, lt: end } },
+    orderBy: { transactionDate: 'desc' },
+    select: {
+      id: true,
+      amount: true,
+      transactionDate: true,
+      merchantName: true,
+      creditCard: { select: { name: true } },
+      category: { select: { name: true } },
+    },
+  })
+
+  const mapped = rows.map(r => ({
+    id: r.id,
+    date: r.transactionDate.toISOString(),
+    merchant: r.merchantName,
+    amount: r.amount,
+    category: '💳',
+    categoryName: r.category?.name || 'その他',
+    card: r.creditCard?.name || '-',
+    type: r.category?.name === 'サブスクリプション' ? 'SUBSCRIPTION' : 'PURCHASE',
+    status: 'CONFIRMED',
+  }))
+
+  const totalAmount = mapped.reduce((sum, t) => sum + t.amount, 0)
   const plan = (session.user?.plan || 'FREE') as 'FREE' | 'STANDARD' | 'PRO'
   const planLimits = getPlanLimits(plan)
-  const canAdd = canAddMonthlyTransaction(plan, mockTransactions.length)
+  const devNoLimits = isPlanLimitsDisabled()
+  const canAdd = devNoLimits ? true : canAddMonthlyTransaction(plan, mapped.length)
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -204,11 +124,11 @@ export default async function TransactionsPage() {
               <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                 <div className="text-center">
                   <div className="text-2xl font-bold text-blue-600">
-                    {mockTransactions.length}件
+                    {mapped.length}件
                   </div>
                   <div className="text-sm text-gray-600">
                     今月の取引
-                    {plan === 'FREE' && (
+                    {plan === 'FREE' && !devNoLimits && (
                       <span className="ml-1 text-xs text-gray-500">
                         / 上限 {planLimits.monthlyTransactions}件
                       </span>
@@ -223,12 +143,12 @@ export default async function TransactionsPage() {
                 </div>
                 <div className="text-center">
                   <div className="text-2xl font-bold text-purple-600">
-                    ¥{Math.round(totalAmount / mockTransactions.length).toLocaleString()}
+                    ¥{mapped.length ? Math.round(totalAmount / mapped.length).toLocaleString() : 0}
                   </div>
                   <div className="text-sm text-gray-600">平均単価</div>
                 </div>
               </div>
-              {plan === 'FREE' && !canAdd && (
+              {plan === 'FREE' && !devNoLimits && !canAdd && (
                 <div className="mt-4 text-center">
                   <div className="inline-flex items-center text-sm bg-yellow-50 text-yellow-800 border border-yellow-200 rounded px-3 py-2">
                     今月の無料上限（{planLimits.monthlyTransactions}件）に達しました。
@@ -260,10 +180,17 @@ export default async function TransactionsPage() {
                   <Calendar className="w-4 h-4 text-gray-500" />
                   <select className="border border-gray-300 rounded px-3 py-1 text-sm focus:outline-none focus:border-blue-500">
                     <option>今月</option>
-                    <option disabled={plan === 'FREE'}>先月（有料）</option>
-                    <option disabled={plan === 'FREE'}>過去3ヶ月（有料）</option>
-                    <option disabled={plan === 'FREE'}>カスタム（有料）</option>
+                    <option disabled={plan === 'FREE' && !devNoLimits}>先月</option>
+                    <option disabled={plan === 'FREE' && !devNoLimits}>過去3ヶ月</option>
+                    <option disabled={plan === 'FREE' && !devNoLimits}>カスタム</option>
                   </select>
+                  {plan === 'FREE' && !devNoLimits ? (
+                    <Link href="/pricing" className="text-xs text-blue-600 underline ml-1">
+                      カスタム期間は有料で解放
+                    </Link>
+                  ) : (
+                    <Button variant="outline" size="sm">期間を選択</Button>
+                  )}
                 </div>
 
                 <div className="flex items-center space-x-2">
@@ -288,7 +215,7 @@ export default async function TransactionsPage() {
 
                 <Button variant="outline" size="sm">リセット</Button>
               </div>
-              {plan === 'FREE' && (
+              {plan === 'FREE' && !devNoLimits && (
                 <div className="mt-2 text-xs text-gray-500">
                   CSVエクスポートは当月のみ利用できます（有料で期間指定可）
                 </div>
@@ -303,16 +230,16 @@ export default async function TransactionsPage() {
             <CardTitle className="flex items-center">
               📱 取引一覧
               <span className="ml-2 text-sm font-normal text-gray-500">
-                ({mockTransactions.length}件)
+                ({mapped.length}件)
               </span>
             </CardTitle>
             <CardDescription>
-              2024年3月の取引履歴
+              今月の取引履歴
             </CardDescription>
           </CardHeader>
           <CardContent className="p-0">
             <div className="overflow-hidden">
-              {mockTransactions.map((transaction, index) => (
+              {mapped.map((transaction, index) => (
                 <div key={transaction.id} className={`p-4 border-b border-gray-100 hover:bg-gray-50 transition-colors ${index === 0 ? 'border-t-0' : ''}`}>
                   <div className="flex items-center justify-between">
                     <div className="flex items-center space-x-4">

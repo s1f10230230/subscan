@@ -36,12 +36,8 @@ export default function OnboardingPage() {
 
   const handleGmailConnect = async () => {
     setIsAnalyzing(true)
-    // Gmail接続のシミュレーション
-    await signIn('google', { redirect: false })
-
-    // 分析プログレスのシミュレーション
-    nextStep()
-    simulateAnalysis()
+    // Google OAuth後はダッシュボードへ遷移（セッション確立後の保護ルート）
+    await signIn('google', { callbackUrl: '/dashboard' })
   }
 
   const simulateAnalysis = () => {

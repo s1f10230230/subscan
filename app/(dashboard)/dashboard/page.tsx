@@ -1,39 +1,86 @@
 import { getServerSession } from "next-auth/next"
 import { authOptions } from "@/lib/auth"
 import { redirect } from "next/navigation"
+import { prisma } from '@/lib/prisma'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import Link from "next/link"
 import { TrendingUp, TrendingDown, CreditCard, AlertTriangle, Mail, RefreshCw, ChevronRight } from "lucide-react"
+import SyncNowButton from '@/components/dashboard/SyncNowButton'
 
 // Force dynamic rendering
 export const dynamic = 'force-dynamic'
 
-// モックデータ（後でAPIから取得）
-const mockData = {
-  monthlySpending: 127340,
-  previousMonthSpending: 113420,
-  transactionCount: 15,
-  averageTransaction: 8489,
-  subscriptions: 4,
-  subscriptionsCost: 3100,
-  annualSavings: 18600,
-  recentTransactions: [
-    { id: 1, date: '3/15', merchant: 'Amazon', amount: 2480, category: '🛒' },
-    { id: 2, date: '3/14', merchant: 'Netflix', amount: 1490, category: '📺' },
-    { id: 3, date: '3/14', merchant: 'セブン', amount: 384, category: '🏪' },
-    { id: 4, date: '3/13', merchant: '楽天', amount: 8900, category: '🛍️' },
-    { id: 5, date: '3/13', merchant: 'Uber Eats', amount: 1250, category: '🍕' },
-  ],
-  suspiciousSubscriptions: [
-    { name: 'Spotify', cost: 980, lastUsed: '30日前', savings: 11760, status: 'HIGH' },
-  ],
-  categories: [
-    { name: '食費', percentage: 40, amount: 50936 },
-    { name: '交通費', percentage: 25, amount: 31835 },
-    { name: 'サブスク', percentage: 20, amount: 25468 },
-    { name: 'その他', percentage: 15, amount: 19101 },
-  ]
+function monthRange(d = new Date()) {
+  const start = new Date(d.getFullYear(), d.getMonth(), 1)
+  const next = new Date(d.getFullYear(), d.getMonth() + 1, 1)
+  return { start, end: next }
+}
+
+async function getOverview(userId: string) {
+  const { start, end } = monthRange()
+  const { start: prevStart, end: prevEnd } = monthRange(new Date(new Date().getFullYear(), new Date().getMonth() - 1, 1))
+
+  const [curr, prev, recent, subs] = await Promise.all([
+    prisma.transaction.aggregate({
+      where: { userId, transactionDate: { gte: start, lt: end } },
+      _sum: { amount: true },
+      _count: { _all: true },
+    }),
+    prisma.transaction.aggregate({
+      where: { userId, transactionDate: { gte: prevStart, lt: prevEnd } },
+      _sum: { amount: true },
+    }),
+    prisma.transaction.findMany({
+      where: { userId },
+      orderBy: { transactionDate: 'desc' },
+      take: 5,
+      select: { id: true, amount: true, transactionDate: true, merchantName: true, category: { select: { name: true } } },
+    }),
+    prisma.subscription.findMany({ where: { userId, status: 'ACTIVE' }, select: { amount: true } }),
+  ])
+
+  const monthlySpending = curr._sum.amount || 0
+  const previousMonthSpending = prev._sum.amount || 0
+  const transactionCount = curr._count._all || 0
+  const averageTransaction = transactionCount ? Math.round(monthlySpending / transactionCount) : 0
+  const subscriptions = subs.length
+  const subscriptionsCost = subs.reduce((s, x) => s + (x.amount || 0), 0)
+
+  // simple category breakdown for current month (top 4)
+  const catAgg = await prisma.transaction.groupBy({
+    by: ['categoryId'],
+    where: { userId, transactionDate: { gte: start, lt: end } },
+    _sum: { amount: true },
+    orderBy: { _sum: { amount: 'desc' } },
+    take: 4,
+  })
+  const categories = [] as { name: string, amount: number, percentage: number }[]
+  const total = monthlySpending || 1
+  for (const row of catAgg) {
+    const cat = await prisma.category.findUnique({ where: { id: row.categoryId } })
+    const amt = row._sum.amount || 0
+    categories.push({ name: cat?.name || 'その他', amount: amt, percentage: Math.round((amt / total) * 100) })
+  }
+
+  return {
+    monthlySpending,
+    previousMonthSpending,
+    transactionCount,
+    averageTransaction,
+    subscriptions,
+    subscriptionsCost,
+    annualSavings: Math.round(subscriptionsCost * 12 * 0.5), // placeholder heuristic
+    recentTransactions: recent.map(r => ({
+      id: r.id,
+      date: r.transactionDate.toLocaleDateString('ja-JP', { month: 'numeric', day: 'numeric' }),
+      merchant: r.merchantName,
+      amount: r.amount,
+      category: '💳',
+    })),
+    suspiciousSubscriptions: [],
+    categories,
+  }
 }
 
 export default async function DashboardPage() {
@@ -43,7 +90,9 @@ export default async function DashboardPage() {
     redirect('/signin')
   }
 
-  const growthRate = ((mockData.monthlySpending - mockData.previousMonthSpending) / mockData.previousMonthSpending * 100).toFixed(1)
+  const data = await getOverview(session.user!.id!)
+  const base = data.previousMonthSpending || 1
+  const growthRate = ((data.monthlySpending - base) / base * 100).toFixed(1)
   const isPositiveGrowth = parseFloat(growthRate) > 0
 
   return (
@@ -60,13 +109,12 @@ export default async function DashboardPage() {
               <span className="text-xs px-2 py-1 rounded bg-gray-100 text-gray-700 border border-gray-200">
                 プラン: {session.user?.plan || 'FREE'}
               </span>
-              <Button variant="outline" size="sm">
-                <RefreshCw className="w-4 h-4 mr-2" />
-                同期
-              </Button>
-              <Button variant="outline" size="sm">
-                ⚙️ 設定
-              </Button>
+              <SyncNowButton />
+              <Link href="/cards">
+                <Button variant="outline" size="sm">
+                  💳 カード
+                </Button>
+              </Link>
               <Link href="/pricing">
                 <Button variant="outline" size="sm">
                   💳 プラン
@@ -89,7 +137,7 @@ export default async function DashboardPage() {
                 </CardTitle>
               </CardHeader>
               <CardContent>
-                <div className="text-2xl font-bold">¥{mockData.monthlySpending.toLocaleString()}</div>
+                <div className="text-2xl font-bold">¥{data.monthlySpending.toLocaleString()}</div>
                 <p className={`text-xs flex items-center ${isPositiveGrowth ? 'text-red-600' : 'text-green-600'}`}>
                   {isPositiveGrowth ?
                     <TrendingUp className="w-3 h-3 mr-1" /> :
@@ -105,9 +153,9 @@ export default async function DashboardPage() {
                 <CardTitle className="text-base">🔄 利用回数</CardTitle>
               </CardHeader>
               <CardContent>
-                <div className="text-2xl font-bold">{mockData.transactionCount}回</div>
+                <div className="text-2xl font-bold">{data.transactionCount}回</div>
                 <p className="text-xs text-muted-foreground">
-                  平均 ¥{mockData.averageTransaction.toLocaleString()}
+                  平均 ¥{data.averageTransaction.toLocaleString()}
                 </p>
               </CardContent>
             </Card>
@@ -116,15 +164,15 @@ export default async function DashboardPage() {
               <CardHeader className="pb-2">
                 <CardTitle className="text-base flex items-center">
                   📱 サブスク
-                  {mockData.suspiciousSubscriptions.length > 0 && (
+                  {data.suspiciousSubscriptions.length > 0 && (
                     <AlertTriangle className="w-4 h-4 ml-2 text-orange-500" />
                   )}
                 </CardTitle>
               </CardHeader>
               <CardContent>
-                <div className="text-2xl font-bold">{mockData.subscriptions}個</div>
+                <div className="text-2xl font-bold">{data.subscriptions}個</div>
                 <p className="text-xs text-muted-foreground">
-                  月額 ¥{mockData.subscriptionsCost.toLocaleString()}
+                  月額 ¥{data.subscriptionsCost.toLocaleString()}
                 </p>
               </CardContent>
             </Card>
@@ -134,7 +182,7 @@ export default async function DashboardPage() {
                 <CardTitle className="text-base">💸 節約可能額</CardTitle>
               </CardHeader>
               <CardContent>
-                <div className="text-2xl font-bold text-green-600">¥{mockData.annualSavings.toLocaleString()}</div>
+                <div className="text-2xl font-bold text-green-600">¥{data.annualSavings.toLocaleString()}</div>
                 <p className="text-xs text-muted-foreground">
                   年間予想
                 </p>
@@ -187,7 +235,7 @@ export default async function DashboardPage() {
             </CardHeader>
             <CardContent>
               <div className="space-y-4">
-                {mockData.categories.map((category, index) => (
+                {data.categories.map((category, index) => (
                   <div key={index} className="flex items-center justify-between">
                     <div className="flex items-center">
                       <div className={`w-4 h-4 rounded-full mr-3 ${
@@ -220,9 +268,9 @@ export default async function DashboardPage() {
               </CardDescription>
             </CardHeader>
             <CardContent>
-              {mockData.suspiciousSubscriptions.length > 0 ? (
+              {data.suspiciousSubscriptions.length > 0 ? (
                 <div className="space-y-4">
-                  {mockData.suspiciousSubscriptions.map((sub, index) => (
+                  {data.suspiciousSubscriptions.map((sub, index) => (
                     <div key={index} className="border border-orange-200 bg-orange-50 rounded-lg p-4">
                       <div className="flex justify-between items-start mb-2">
                         <h3 className="font-medium">🎵 {sub.name}</h3>
@@ -261,7 +309,7 @@ export default async function DashboardPage() {
             </CardHeader>
             <CardContent>
               <div className="space-y-3">
-                {mockData.recentTransactions.map((transaction) => (
+                {data.recentTransactions.map((transaction) => (
                   <div key={transaction.id} className="flex justify-between items-center p-3 bg-gray-50 rounded-lg">
                     <div className="flex items-center">
                       <span className="text-lg mr-3">{transaction.category}</span>

@@ -19,6 +19,8 @@ export default withAuth(
           '/privacy',
           '/terms',
           '/pricing',
+          '/me',
+          '/onboarding',
         ]
 
         if (publicPaths.includes(pathname)) {
