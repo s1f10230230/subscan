@@ -1,50 +1,80 @@
-// gmail-card-parser.ts (integrated)
-// Parse credit card usage emails (JCB / Rakuten Card) from Gmail, extract amount/merchant/date,
-// detect subscriptions (including JCB "海外利用分" $20 patterns), and aggregate monthly totals by card & category.
+// gmail-card-parser.ts
+//
+// This module provides functions to fetch and parse credit-card usage
+// notification emails from Gmail.  It supports JCB and Rakuten cards
+// and includes heuristics to detect subscription-like transactions.
+//
+// The parser extracts the amount, merchant and date from each email
+// and normalizes merchant names.  It also flags likely subscription
+// transactions.  In particular, recurring overseas charges from
+// JCB (表示に「海外利用分」が含まれるもの) are treated as potential
+// subscriptions even though the amount varies from month to month due
+// to exchange-rate fluctuations.  The subscription refinement logic
+// considers repeated transactions across different months and uses
+// a relaxed threshold for overseas charges.
 
 import { google, gmail_v1 } from "googleapis";
+
+// -----------------------------------------------------------------------------
+// Types
+// -----------------------------------------------------------------------------
 
 export type Provider = "JCB" | "Rakuten" | "Unknown";
 export type Category = "交通費" | "食費" | "サブすく" | "その他";
 
 export interface Transaction {
-  id: string; // Gmail message id
-  emailTs?: string; // RFC3339
-  sender?: string; // From header
-  provider: Provider;
-  cardName?: string; // if parsable from body
-  amount: number | null; // JPY
-  merchantRaw?: string;
-  merchant: string; // normalized
-  merchantNorm: string; // lowercased NFKC
-  occurredAt?: string; // yyyy-MM-dd HH:mm (local)
-  labels?: string[];
-  subject?: string;
-  isSubscriptionCandidate: boolean; // preliminary (keyword/overseas-based)
-  category: Category;
+  id: string;               // Gmail message id
+  emailTs?: string;         // RFC3339 timestamp from Date header
+  sender?: string;          // From header
+  provider: Provider;       // Detected card provider
+  cardName?: string;        // Optional card name if present in email
+  amount: number | null;    // Amount in JPY (null if unknown)
+  merchantRaw?: string;     // Raw merchant string extracted from email
+  merchant: string;         // Cleaned merchant name
+  merchantNorm: string;     // Normalized (lowercase) merchant name
+  occurredAt?: string;      // Local time (YYYY-MM-DD HH:mm) when transaction occurred
+  labels?: string[];        // Gmail labels
+  subject?: string;         // Email subject
+  isSubscriptionCandidate: boolean; // True if preliminary subscription heuristic
+  category: Category;       // Categorized spending type
 }
 
 export interface MonthlySummaryRow {
-  month: string; // YYYY-MM
+  month: string;                        // YYYY-MM
   provider: Provider;
-  total: number;
-  byCategory: Record<Category, number>;
-  txCount: number;
+  total: number;                        // Sum of amounts for the month
+  byCategory: Record<Category, number>; // Sum by category
+  txCount: number;                      // Transaction count
 }
 
 export interface ParseOptions {
-  newerThanDays?: number; // Gmail search window
-  maxMessages?: number;   // cap for each provider search
+  newerThanDays?: number; // Time window for Gmail search (days)
+  maxMessages?: number;   // Maximum messages per provider
 }
 
-// ===== OAuth helper (example) =====
+// -----------------------------------------------------------------------------
+// OAuth helper
+// -----------------------------------------------------------------------------
+
+/**
+ * Create a Gmail client using a bare OAuth access token.  This helper is
+ * provided as an example; in a real application you would manage tokens
+ * through OAuth flows.
+ */
 export function getGmailClientFromAccessToken(accessToken: string) {
   const oAuth2Client = new google.auth.OAuth2();
   oAuth2Client.setCredentials({ access_token: accessToken });
   return google.gmail({ version: "v1", auth: oAuth2Client });
 }
 
-// ===== Gmail fetchers =====
+// -----------------------------------------------------------------------------
+// Gmail fetchers
+// -----------------------------------------------------------------------------
+
+/**
+ * Fetch a list of message IDs matching the given Gmail search query.
+ * Pagination is handled to respect the max limit.
+ */
 async function listMessageIds(
   gmail: gmail_v1.Gmail,
   q: string,
@@ -53,7 +83,12 @@ async function listMessageIds(
   let pageToken: string | undefined = undefined;
   const ids: string[] = [];
   do {
-    const res = await gmail.users.messages.list({ userId: "me", q, pageToken, maxResults: Math.min(100, max) });
+    const res = await gmail.users.messages.list({
+      userId: "me",
+      q,
+      pageToken,
+      maxResults: Math.min(100, max),
+    });
     const messages = res.data.messages || [];
     ids.push(...messages.map((m) => m.id!).filter(Boolean));
     pageToken = res.data.nextPageToken || undefined;
@@ -62,26 +97,45 @@ async function listMessageIds(
   return ids.slice(0, max);
 }
 
+/**
+ * Decode base64url-encoded strings into UTF-8.
+ */
 function decodeBase64Url(input: string): string {
   const normalized = input.replace(/-/g, "+").replace(/_/g, "/");
   const buff = Buffer.from(normalized, "base64");
   return buff.toString("utf8");
 }
 
+/**
+ * Strip HTML tags and convert <br> to newlines.  This helps us extract
+ * plaintext from HTML bodies.
+ */
 function stripHtml(html: string): string {
-  return html.replace(/<\s*br\s*\/?>(?=\s|$)/gi, "\n").replace(/<[^>]+>/g, " ").replace(/\s+\n/g, "\n").replace(/\n\s+/g, "\n");
+  return html
+    .replace(/<\s*br\s*\/?>(?=\s|$)/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+\n/g, "\n")
+    .replace(/\n\s+/g, "\n");
 }
 
-async function getMessageBody(gmail: gmail_v1.Gmail, id: string): Promise<{ text: string; headers: Record<string,string>; labels: string[] }>
-{
+/**
+ * Retrieve the body of a Gmail message.  We prefer text/plain parts if
+ * available; otherwise we fall back to text/html and finally to the snippet.
+ * Returns the extracted text, header map and label list.
+ */
+async function getMessageBody(
+  gmail: gmail_v1.Gmail,
+  id: string
+): Promise<{ text: string; headers: Record<string, string>; labels: string[] }> {
   const res = await gmail.users.messages.get({ userId: "me", id, format: "full" });
   const payload = res.data.payload;
   const headersArr = payload?.headers || [];
-  const headers: Record<string,string> = {};
-  for (const h of headersArr) if (h.name && h.value) headers[h.name] = h.value;
+  const headers: Record<string, string> = {};
+  for (const h of headersArr) {
+    if (h.name && h.value) headers[h.name] = h.value;
+  }
   const labels = res.data.labelIds || [];
 
-  // Prefer text/plain, fallback to text/html, then snippet
   function walk(p?: gmail_v1.Schema$MessagePart): string | null {
     if (!p) return null;
     const mime = p.mimeType || "";
@@ -99,24 +153,45 @@ async function getMessageBody(gmail: gmail_v1.Gmail, id: string): Promise<{ text
   }
 
   let text = walk(payload) || res.data.snippet || "";
-  // Normalize unicode width etc.
+  // Normalize full-width/half-width characters
   text = text.normalize("NFKC");
   return { text, headers, labels };
 }
 
-// ===== Provider detection =====
-function detectProvider(headers: Record<string,string>, subject: string, text: string): Provider {
+// -----------------------------------------------------------------------------
+// Provider detection
+// -----------------------------------------------------------------------------
+
+/**
+ * Determine which card provider sent the email based on headers, subject
+ * or body.  If none match, returns "Unknown".
+ */
+function detectProvider(
+  headers: Record<string, string>,
+  subject: string,
+  text: string
+): Provider {
   const from = (headers["From"] || "").toLowerCase();
   const subj = (subject || "").normalize("NFKC");
-  if (from.includes("qa.jcb.co.jp") || subj.includes("JCBカード／ショッピングご利用のお知らせ")) return "JCB";
-  if (from.includes("rakuten-card.co.jp") || subj.includes("楽天カード") || text.includes("楽天カード")) return "Rakuten";
+  if (from.includes("qa.jcb.co.jp") || subj.includes("JCBカード／ショッピングご利用のお知らせ")) {
+    return "JCB";
+  }
+  if (from.includes("rakuten-card.co.jp") || subj.includes("楽天カード") || text.includes("楽天カード")) {
+    return "Rakuten";
+  }
   return "Unknown";
 }
 
-// ===== JCB parser =====
+// -----------------------------------------------------------------------------
+// Regex patterns for JCB emails
+// -----------------------------------------------------------------------------
+
+// Extract amount from JCB usage notification (e.g. 【ご利用金額】3,282円)
 const reJcbAmount = /【?ご利用金額】?\s*([\d,]+)\s*円/;
+// Extract merchant from JCB usage notification (e.g. 【ご利用先】JCBクレジットご利用分（海外利用分）)
 const reJcbMerchant = /【?ご利用先】?\s*([^\n\r]+)/;
-const reJcbDate = /【?ご利用日時（?日本時間）?】?\s*(\d{4}\/\d{2}\/\d{2})\s*(\d{2}:\d{2})?/; // time optional
+// Extract date/time from JCB usage notification.  Time component is optional.
+const reJcbDate = /【?ご利用日時（?日本時間）?】?\s*(\d{4}\/\d{2}\/\d{2})\s*(\d{2}:\d{2})?/;
 
 function parseJCB(text: string) {
   const amount = (reJcbAmount.exec(text)?.[1] || "").replace(/,/g, "");
@@ -131,7 +206,10 @@ function parseJCB(text: string) {
   };
 }
 
-// ===== Rakuten parser =====
+// -----------------------------------------------------------------------------
+// Regex patterns for Rakuten emails
+// -----------------------------------------------------------------------------
+
 const reRakuAmount = /ご利用金額[：:]*\s*([\d,]+)\s*円/;
 const reRakuMerchant = /(ご利用先|ご利用店名)[：:]*\s*([^\n\r]+)/;
 const reRakuDate = /ご利用日[：:]*\s*(\d{4}\/\d{1,2}\/\d{1,2})/;
@@ -148,11 +226,21 @@ function parseRakuten(text: string) {
   };
 }
 
-// ===== Normalization & heuristics =====
+// -----------------------------------------------------------------------------
+// Normalization & heuristics
+// -----------------------------------------------------------------------------
+
+/**
+ * Normalize merchant names by applying Unicode normalization, removing
+ * boilerplate text (e.g. "JCBクレジットご利用分（海外利用分）"), stripping
+ * brackets and applying manual corrections for common mis-encodings.
+ */
 function normalizeMerchant(raw?: string): { merchant: string; merchantNorm: string } {
   let m = (raw || "").normalize("NFKC");
+  // Remove generic phrases and bracketed extras
   m = m.replace(/JCBクレジットご利用分/g, "").replace(/（海外利用分）/g, "").replace(/[（）]/g, "").trim();
-  const fixes: Record<string,string> = {
+  // Fix common mis-spellings and garbled characters
+  const fixes: Record<string, string> = {
     "ロケツトナウ": "ロケットナウ",
     "ニホンマクドナルド": "マクドナルド",
     "ネツトフリツクス": "ネットフリックス",
@@ -163,6 +251,9 @@ function normalizeMerchant(raw?: string): { merchant: string; merchantNorm: stri
   return { merchant, merchantNorm };
 }
 
+/**
+ * Determine if a merchant is a known subscription service by keyword.
+ */
 function isKnownSubscriptionByKeyword(merchantNorm: string): boolean {
   const kws = [
     "netflix",
@@ -183,24 +274,86 @@ function isKnownSubscriptionByKeyword(merchantNorm: string): boolean {
   return kws.some((k) => merchantNorm.includes(k));
 }
 
-function prelimSubscriptionFlag(provider: Provider, merchantRaw: string, merchantNorm: string): boolean {
+/**
+ * Initial heuristic: mark as potential subscription if the provider is JCB
+ * and the raw merchant contains "海外利用分" (overseas use), or if the
+ * normalized merchant name matches a known subscription keyword.
+ */
+function prelimSubscriptionFlag(
+  provider: Provider,
+  merchantRaw: string,
+  merchantNorm: string
+): boolean {
   if (provider === "JCB" && /海外利用分/.test(merchantRaw)) return true;
   if (isKnownSubscriptionByKeyword(merchantNorm)) return true;
   return false;
 }
 
-function categorize(merchant: string, merchantNorm: string, prelimSub: boolean): Category {
-  const transportKW = ["pasmo", "モバイルpasmo", "suica", "チャージ", "jr", "東京メトロ", "小田急", "京王", "都営", "バス"];
-  if (transportKW.some(k => merchantNorm.includes(k))) return "交通費";
+/**
+ * Categorize a transaction into spending categories based on merchant and
+ * subscription flag.  Transportation keywords take precedence, followed
+ * by food-related keywords.  If prelimSub is true, categorize as
+ * subscription (サブすく) unless explicitly handled by other categories.
+ */
+function categorize(
+  merchant: string,
+  merchantNorm: string,
+  prelimSub: boolean
+): Category {
+  const transportKW = [
+    "pasmo",
+    "モバイルpasmo",
+    "suica",
+    "チャージ",
+    "jr",
+    "東京メトロ",
+    "小田急",
+    "京王",
+    "都営",
+    "バス",
+  ];
+  if (transportKW.some((k) => merchantNorm.includes(k))) return "交通費";
 
-  const foodKW = ["マクドナルド", "松屋", "吉野家", "すき家", "モス", "ケンタッキー", "サイゼ", "すき家", "ガスト", "びっくりドンキー", "ローソン", "セブン", "ファミマ", "からあげ", "ラーメン", "うどん", "そば", "寿司", "カフェ", "ドトール", "スタバ"];
-  if (foodKW.some(k => merchant.includes(k) || merchantNorm.includes(k.toLowerCase()))) return "食費";
+  const foodKW = [
+    "マクドナルド",
+    "松屋",
+    "吉野家",
+    "すき家",
+    "モス",
+    "ケンタッキー",
+    "サイゼ",
+    "ガスト",
+    "びっくりドンキー",
+    "ローソン",
+    "セブン",
+    "ファミマ",
+    "からあげ",
+    "ラーメン",
+    "うどん",
+    "そば",
+    "寿司",
+    "カフェ",
+    "ドトール",
+    "スタバ",
+  ];
+  if (foodKW.some((k) => merchant.includes(k) || merchantNorm.includes(k.toLowerCase()))) {
+    return "食費";
+  }
 
   if (prelimSub) return "サブすく";
   return "その他";
 }
 
-// ===== Core: fetch + parse =====
+// -----------------------------------------------------------------------------
+// Core: fetch + parse
+// -----------------------------------------------------------------------------
+
+/**
+ * Fetch credit-card notification emails from Gmail and parse them into
+ * Transaction objects.  Supports JCB and Rakuten cards.  Uses a search
+ * query targeting the card issuers and time window.  Optionally caps
+ * the total number of messages processed.
+ */
 export async function fetchAndParseTransactions(
   gmail: gmail_v1.Gmail,
   opts: ParseOptions = { newerThanDays: 90, maxMessages: 400 }
@@ -208,13 +361,13 @@ export async function fetchAndParseTransactions(
   const newer = opts.newerThanDays ?? 90;
   const max = opts.maxMessages ?? 400;
 
+  // Separate queries per provider so we can cap results evenly.
   const queries = [
     `from:qa.jcb.co.jp subject:(ご利用) newer_than:${newer}d`,
     `from:rakuten-card.co.jp (ご利用 OR 利用) newer_than:${newer}d`,
   ];
 
   const transactions: Transaction[] = [];
-
   for (const q of queries) {
     const ids = await listMessageIds(gmail, q, Math.floor(max / queries.length));
     for (const id of ids) {
@@ -273,11 +426,24 @@ export async function fetchAndParseTransactions(
       }
     }
   }
-
   return transactions;
 }
 
-// ===== Subscription refinement =====
+// -----------------------------------------------------------------------------
+// Subscription refinement
+// -----------------------------------------------------------------------------
+
+/**
+ * Refine preliminary subscription flags by grouping transactions by provider
+ * and merchant, then looking at the distribution of amounts across months.
+ *
+ * A group is promoted to subscription if it spans multiple months and
+ * the standard deviation of the amounts is below a threshold.  For
+ * overseas JCB charges (merchantRaw contains "海外利用分"), we use a
+ * higher threshold of max(300 JPY, 20% of the mean) to account for
+ * exchange-rate fluctuations.  Otherwise we use max(100 JPY, 15% of the
+ * mean).
+ */
 export function refineSubscriptionFlags(transactions: Transaction[]): Transaction[] {
   const byKey = new Map<string, Transaction[]>();
   for (const t of transactions) {
@@ -286,16 +452,23 @@ export function refineSubscriptionFlags(transactions: Transaction[]): Transactio
     arr.push(t);
     byKey.set(key, arr);
   }
-
   for (const [, arr] of byKey) {
-    const amts = arr.map((t) => (typeof t.amount === "number" ? t.amount : NaN)).filter((x) => !isNaN(x));
+    const amts = arr
+      .map((t) => (typeof t.amount === "number" ? t.amount : NaN))
+      .filter((x) => !isNaN(x));
     if (amts.length >= 2) {
       const avg = amts.reduce((a, b) => a + b, 0) / amts.length;
-      const sd = Math.sqrt(amts.reduce((s, a) => s + Math.pow(a - avg, 2), 0) / amts.length);
-      const months = new Set(arr.map((t) => (t.emailTs ? toMonth(t.emailTs) : (t.occurredAt ? toMonth(t.occurredAt) : ""))));
-
-      const relaxed = arr.some((t) => /海外利用分/.test(t.merchantRaw || "")) ? Math.max(250, 0.2 * avg) : Math.max(100, 0.15 * avg);
-
+      const sd = Math.sqrt(
+        amts.reduce((s, a) => s + Math.pow(a - avg, 2), 0) / amts.length,
+      );
+      // Distinct months represented by this group
+      const months = new Set(
+        arr.map((t) => (t.emailTs ? toMonth(t.emailTs) : t.occurredAt ? toMonth(t.occurredAt) : "")),
+      );
+      // Relax threshold for overseas JCB charges; otherwise use default
+      const relaxed = arr.some((t) => /海外利用分/.test(t.merchantRaw || ""))
+        ? Math.max(300, 0.2 * avg)
+        : Math.max(100, 0.15 * avg);
       if (months.size >= 2 && sd <= relaxed) {
         for (const t of arr) t.isSubscriptionCandidate = true;
         for (const t of arr) if (t.category === "その他") t.category = "サブすく";
@@ -305,45 +478,59 @@ export function refineSubscriptionFlags(transactions: Transaction[]): Transactio
   return transactions;
 }
 
-// ===== Aggregation =====
+// -----------------------------------------------------------------------------
+// Aggregation
+// -----------------------------------------------------------------------------
+
+/**
+ * Aggregate transactions by month and provider, summing both total and
+ * category-specific spending.  Returns rows sorted by month and provider.
+ */
 export function aggregateMonthly(transactions: Transaction[]): MonthlySummaryRow[] {
   const rows = new Map<string, MonthlySummaryRow>();
   for (const t of transactions) {
-    const month = t.emailTs ? toMonth(t.emailTs) : (t.occurredAt ? toMonth(t.occurredAt) : "");
+    const month = t.emailTs ? toMonth(t.emailTs) : t.occurredAt ? toMonth(t.occurredAt) : "";
     const key = `${month}__${t.provider}`;
-    const cur = rows.get(key) || {
-      month,
-      provider: t.provider,
-      total: 0,
-      byCategory: { "交通費": 0, "食費": 0, "サブすく": 0, "その他": 0 },
-      txCount: 0,
-    };
+    const cur =
+      rows.get(key) || {
+        month,
+        provider: t.provider,
+        total: 0,
+        byCategory: { 交通費: 0, 食費: 0, サブすく: 0, その他: 0 },
+        txCount: 0,
+      };
     const amt = t.amount || 0;
     cur.total += amt;
     cur.byCategory[t.category] += amt;
     cur.txCount += 1;
     rows.set(key, cur);
   }
-  return Array.from(rows.values()).sort((a, b) => (a.month < b.month ? -1 : a.month > b.month ? 1 : a.provider.localeCompare(b.provider)));
+  return Array.from(rows.values()).sort((a, b) => {
+    if (a.month < b.month) return -1;
+    if (a.month > b.month) return 1;
+    return a.provider.localeCompare(b.provider);
+  });
 }
 
-// ===== Date helpers (no external deps) =====
+// -----------------------------------------------------------------------------
+// Date helpers
+// -----------------------------------------------------------------------------
+
+/** Normalize dates of the form YYYY/MM/DD or YYYY-M-D into YYYY-MM-DD. */
 function normalizeYMD(input: string): string {
-  // Accepts 'YYYY/MM/DD' or 'YYYY-M-D' etc. Returns 'YYYY-MM-DD'
-  const parts = input.replace(/\./g, '-').replace(/\//g, '-').split('-')
-  if (parts.length < 3) return input
-  const [y, m, d] = parts
-  const mm = m.padStart(2, '0')
-  const dd = d.padStart(2, '0')
-  return `${y}-${mm}-${dd}`
+  const parts = input.replace(/\./g, "-").replace(/\//g, "-").split("-");
+  if (parts.length < 3) return input;
+  const [y, m, d] = parts;
+  const mm = m.padStart(2, "0");
+  const dd = d.padStart(2, "0");
+  return `${y}-${mm}-${dd}`;
 }
 
+/** Convert an ISO string or a date-like string into a YYYY-MM representation. */
 function toMonth(input: string): string {
-  // input may be ISO string or 'YYYY-MM-DD ...' or 'YYYY/MM/DD ...'
-  if (/^\d{4}-\d{2}-\d{2}/.test(input)) return input.slice(0, 7)
-  if (/^\d{4}\/\d{1,2}\/\d{1,2}/.test(input)) return normalizeYMD(input.slice(0, 10)).slice(0, 7)
-  // Try Date parsing
-  const d = new Date(input)
-  if (!isNaN(d.getTime())) return d.toISOString().slice(0, 7)
-  return ''
+  if (/^\d{4}-\d{2}-\d{2}/.test(input)) return input.slice(0, 7);
+  if (/^\d{4}\/\d{1,2}\/\d{1,2}/.test(input)) return normalizeYMD(input.slice(0, 10)).slice(0, 7);
+  const d = new Date(input);
+  if (!isNaN(d.getTime())) return d.toISOString().slice(0, 7);
+  return "";
 }

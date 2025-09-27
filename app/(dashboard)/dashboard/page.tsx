@@ -3,10 +3,12 @@ import { authOptions } from "@/lib/auth"
 import { redirect } from "next/navigation"
 import { prisma } from '@/lib/prisma'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Button } from "@/components/ui/button"
 import Link from "next/link"
 import { TrendingUp, TrendingDown, CreditCard, AlertTriangle, Mail, RefreshCw, ChevronRight } from "lucide-react"
 import SyncNowButton from '@/components/dashboard/SyncNowButton'
+import SpendingTrendChart, { TrendPoint } from '@/components/dashboard/SpendingTrendChart'
 
 // Force dynamic rendering
 export const dynamic = 'force-dynamic'
@@ -15,6 +17,28 @@ function monthRange(d = new Date()) {
   const start = new Date(d.getFullYear(), d.getMonth(), 1)
   const next = new Date(d.getFullYear(), d.getMonth() + 1, 1)
   return { start, end: next }
+}
+
+async function getMonthlyTrend(userId: string, months = 6): Promise<TrendPoint[]> {
+  const now = new Date()
+  const keys: string[] = []
+  for (let i = months - 1; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1)
+    const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+    keys.push(ym)
+  }
+  const results: TrendPoint[] = []
+  for (const ym of keys) {
+    const [y, m] = ym.split('-').map((x) => parseInt(x, 10))
+    const start = new Date(y, m - 1, 1)
+    const end = new Date(y, m, 1)
+    const agg = await prisma.transaction.aggregate({
+      where: { userId, transactionDate: { gte: start, lt: end } },
+      _sum: { amount: true },
+    })
+    results.push({ month: ym, total: agg._sum.amount || 0 })
+  }
+  return results
 }
 
 async function getOverview(userId: string) {
@@ -91,6 +115,7 @@ export default async function DashboardPage() {
   }
 
   const data = await getOverview(session.user!.id!)
+  const trend = await getMonthlyTrend(session.user!.id!, 6)
   const base = data.previousMonthSpending || 1
   const growthRate = ((data.monthlySpending - base) / base * 100).toFixed(1)
   const isPositiveGrowth = parseFloat(growthRate) > 0
@@ -126,11 +151,12 @@ export default async function DashboardPage() {
       </div>
 
       <div className="max-w-7xl mx-auto px-4 py-8">
-        {/* 概要カード */}
+        {/* 概要カード（モバイルは横スクロール・スナップ） */}
         <div className="mb-8">
           <h2 className="text-xl font-bold text-gray-900 mb-4">📊 今月の概要</h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-            <Card>
+          <div className="-mx-4 px-4 overflow-x-auto md:overflow-visible md:mx-0 md:px-0">
+            <div className="flex gap-4 snap-x snap-mandatory md:grid md:grid-cols-2 lg:grid-cols-4 md:gap-6">
+              <Card className="min-w-[80%] snap-center md:min-w-0">
               <CardHeader className="pb-2">
                 <CardTitle className="text-base flex items-center">
                   💰 月間支出
@@ -146,9 +172,9 @@ export default async function DashboardPage() {
                   {isPositiveGrowth ? '+' : ''}{growthRate}% ↗
                 </p>
               </CardContent>
-            </Card>
+              </Card>
 
-            <Card>
+              <Card className="min-w-[80%] snap-center md:min-w-0">
               <CardHeader className="pb-2">
                 <CardTitle className="text-base">🔄 利用回数</CardTitle>
               </CardHeader>
@@ -158,9 +184,9 @@ export default async function DashboardPage() {
                   平均 ¥{data.averageTransaction.toLocaleString()}
                 </p>
               </CardContent>
-            </Card>
+              </Card>
 
-            <Card>
+              <Card className="min-w-[80%] snap-center md:min-w-0">
               <CardHeader className="pb-2">
                 <CardTitle className="text-base flex items-center">
                   📱 サブスク
@@ -175,9 +201,9 @@ export default async function DashboardPage() {
                   月額 ¥{data.subscriptionsCost.toLocaleString()}
                 </p>
               </CardContent>
-            </Card>
+              </Card>
 
-            <Card>
+              <Card className="min-w-[80%] snap-center md:min-w-0">
               <CardHeader className="pb-2">
                 <CardTitle className="text-base">💸 節約可能額</CardTitle>
               </CardHeader>
@@ -187,73 +213,55 @@ export default async function DashboardPage() {
                   年間予想
                 </p>
               </CardContent>
-            </Card>
+              </Card>
+            </div>
           </div>
         </div>
+        {/* 指標の詳細: グラフ / カテゴリ（Radix Tabs） */}
+        <div className="mb-8">
+          <Tabs defaultValue="trend" className="w-full">
+            <TabsList className="grid grid-cols-2 w-full">
+              <TabsTrigger value="trend">支出推移</TabsTrigger>
+              <TabsTrigger value="categories">カテゴリ別</TabsTrigger>
+            </TabsList>
 
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
-          {/* 支出推移 */}
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center">
-                📈 支出推移
-              </CardTitle>
-              <CardDescription>
-                過去3ヶ月の推移
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="space-y-4">
-                <div className="flex justify-between items-end h-32">
-                  <div className="flex flex-col justify-end items-center">
-                    <div className="bg-blue-200 w-16 h-16 rounded-t"></div>
-                    <span className="text-xs mt-1">Jan</span>
-                    <span className="text-xs text-gray-500">¥89k</span>
-                  </div>
-                  <div className="flex flex-col justify-end items-center">
-                    <div className="bg-blue-300 w-16 h-20 rounded-t"></div>
-                    <span className="text-xs mt-1">Feb</span>
-                    <span className="text-xs text-gray-500">¥112k</span>
-                  </div>
-                  <div className="flex flex-col justify-end items-center">
-                    <div className="bg-blue-500 w-16 h-24 rounded-t"></div>
-                    <span className="text-xs mt-1">Mar</span>
-                    <span className="text-xs text-gray-500">¥127k</span>
-                  </div>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
+            <TabsContent value="trend" className="mt-4">
+              <Card>
+                <CardHeader>
+                  <CardTitle className="flex items-center">📈 支出推移</CardTitle>
+                  <CardDescription>過去6ヶ月の推移</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <SpendingTrendChart data={trend} />
+                </CardContent>
+              </Card>
+            </TabsContent>
 
-          {/* カテゴリ別 */}
-          <Card>
-            <CardHeader>
-              <CardTitle>🍕 カテゴリ別</CardTitle>
-              <CardDescription>
-                今月の支出分類
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="space-y-4">
-                {data.categories.map((category, index) => (
-                  <div key={index} className="flex items-center justify-between">
-                    <div className="flex items-center">
-                      <div className={`w-4 h-4 rounded-full mr-3 ${
-                        ['bg-blue-500', 'bg-green-500', 'bg-yellow-500', 'bg-gray-400'][index]
-                      }`}></div>
-                      <span className="text-sm">{category.name}</span>
-                    </div>
-                    <div className="text-right">
-                      <span className="text-sm font-medium">{category.percentage}%</span>
-                      <div className="text-xs text-gray-500">
-                        ¥{category.amount.toLocaleString()}
+            <TabsContent value="categories" className="mt-4">
+              <Card>
+                <CardHeader>
+                  <CardTitle>🍕 カテゴリ別</CardTitle>
+                  <CardDescription>今月の支出分類</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="space-y-4">
+                    {data.categories.map((category, index) => (
+                      <div key={index} className="flex items-center justify-between">
+                        <div className="flex items-center">
+                          <div className={`w-4 h-4 rounded-full mr-3 ${['bg-blue-500','bg-green-500','bg-yellow-500','bg-gray-400'][index]}`}></div>
+                          <span className="text-sm">{category.name}</span>
+                        </div>
+                        <div className="text-right">
+                          <span className="text-sm font-medium">{category.percentage}%</span>
+                          <div className="text-xs text-gray-500">¥{category.amount.toLocaleString()}</div>
+                        </div>
                       </div>
-                    </div>
+                    ))}
                   </div>
-                ))}
-              </div>
-            </CardContent>
-          </Card>
+                </CardContent>
+              </Card>
+            </TabsContent>
+          </Tabs>
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

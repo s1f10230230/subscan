@@ -3,6 +3,7 @@ import { authOptions } from "@/lib/auth"
 import { redirect } from "next/navigation"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import Link from 'next/link'
 import { ArrowLeft, Filter, Search, Download, Calendar, Plus } from "lucide-react"
 import { canAddMonthlyTransaction, getPlanLimits, isPlanLimitsDisabled } from '@/lib/plan'
@@ -76,6 +77,33 @@ export default async function TransactionsPage() {
   }))
 
   const totalAmount = mapped.reduce((sum, t) => sum + t.amount, 0)
+  // Categories aggregation for current month (from fetched rows)
+  const categoryTotals = mapped.reduce<Record<string, number>>((acc, t) => {
+      const key = t.categoryName || 'その他'
+      acc[key] = (acc[key] || 0) + t.amount
+      return acc
+  }, {})
+  const categoryList = Object.entries(categoryTotals)
+    .map(([name, amount]) => ({ name, amount }))
+    .sort((a, b) => b.amount - a.amount)
+
+  // Calendar aggregation per day
+  const year = new Date().getFullYear()
+  const month = new Date().getMonth() // 0-based
+  const first = new Date(year, month, 1)
+  const last = new Date(year, month + 1, 0)
+  const perDay: Record<number, number> = {}
+  for (const t of mapped) {
+    const d = new Date(t.date)
+    if (d.getMonth() === month && d.getFullYear() === year) {
+      const day = d.getDate()
+      perDay[day] = (perDay[day] || 0) + t.amount
+    }
+  }
+  const leadingBlanks = first.getDay() // 0(Sun) .. 6(Sat)
+  const cells: Array<{ day?: number; total?: number }> = []
+  for (let i = 0; i < leadingBlanks; i++) cells.push({})
+  for (let d = 1; d <= last.getDate(); d++) cells.push({ day: d, total: perDay[d] || 0 })
   const plan = (session.user?.plan || 'FREE') as 'FREE' | 'STANDARD' | 'PRO'
   const planLimits = getPlanLimits(plan)
   const devNoLimits = isPlanLimitsDisabled()
@@ -162,70 +190,78 @@ export default async function TransactionsPage() {
           </Card>
         </div>
 
-        {/* フィルタエリア */}
-        <div className="mb-6">
-          <Card>
-            <CardContent className="p-4">
-              <div className="flex flex-wrap items-center gap-4">
-                <div className="flex items-center space-x-2">
-                  <Search className="w-4 h-4 text-gray-500" />
-                  <input
-                    type="text"
-                    placeholder="店舗名で検索..."
-                    className="border border-gray-300 rounded px-3 py-1 text-sm focus:outline-none focus:border-blue-500"
-                  />
-                </div>
+        {/* タブ: Timeline / Categories / Search / Calendar */}
+        <Tabs defaultValue="timeline" className="w-full">
+          <TabsList className="grid grid-cols-4 w-full sticky top-0 z-10">
+            <TabsTrigger value="timeline">Timeline</TabsTrigger>
+            <TabsTrigger value="categories">Categories</TabsTrigger>
+            <TabsTrigger value="search">Search</TabsTrigger>
+            <TabsTrigger value="calendar">Calendar</TabsTrigger>
+          </TabsList>
 
-                <div className="flex items-center space-x-2">
-                  <Calendar className="w-4 h-4 text-gray-500" />
-                  <select className="border border-gray-300 rounded px-3 py-1 text-sm focus:outline-none focus:border-blue-500">
-                    <option>今月</option>
-                    <option disabled={plan === 'FREE' && !devNoLimits}>先月</option>
-                    <option disabled={plan === 'FREE' && !devNoLimits}>過去3ヶ月</option>
-                    <option disabled={plan === 'FREE' && !devNoLimits}>カスタム</option>
-                  </select>
-                  {plan === 'FREE' && !devNoLimits ? (
-                    <Link href="/pricing" className="text-xs text-blue-600 underline ml-1">
-                      カスタム期間は有料で解放
-                    </Link>
-                  ) : (
-                    <Button variant="outline" size="sm">期間を選択</Button>
-                  )}
-                </div>
+          <TabsContent value="timeline" className="mt-6">
+            {/* フィルタエリア */}
+            <Card className="mb-6">
+              <CardContent className="p-4">
+                <div className="flex flex-wrap items-center gap-4">
+                  <div className="flex items-center space-x-2">
+                    <Search className="w-4 h-4 text-gray-500" />
+                    <input
+                      type="text"
+                      placeholder="店舗名で検索..."
+                      className="border border-gray-300 rounded px-3 py-1 text-sm focus:outline-none focus:border-blue-500"
+                    />
+                  </div>
 
-                <div className="flex items-center space-x-2">
-                  <Filter className="w-4 h-4 text-gray-500" />
-                  <select className="border border-gray-300 rounded px-3 py-1 text-sm focus:outline-none focus:border-blue-500">
-                    <option>すべてのカテゴリ</option>
-                    <option>食事・外食</option>
-                    <option>ショッピング</option>
-                    <option>交通費</option>
-                    <option>エンタメ</option>
-                    <option>サブスク</option>
-                  </select>
-                </div>
+                  <div className="flex items-center space-x-2">
+                    <Calendar className="w-4 h-4 text-gray-500" />
+                    <select className="border border-gray-300 rounded px-3 py-1 text-sm focus:outline-none focus:border-blue-500">
+                      <option>今月</option>
+                      <option disabled={plan === 'FREE' && !devNoLimits}>先月</option>
+                      <option disabled={plan === 'FREE' && !devNoLimits}>過去3ヶ月</option>
+                      <option disabled={plan === 'FREE' && !devNoLimits}>カスタム</option>
+                    </select>
+                    {plan === 'FREE' && !devNoLimits ? (
+                      <Link href="/pricing" className="text-xs text-blue-600 underline ml-1">
+                        カスタム期間は有料で解放
+                      </Link>
+                    ) : (
+                      <Button variant="outline" size="sm">期間を選択</Button>
+                    )}
+                  </div>
 
-                <div className="flex items-center space-x-2">
-                  <select className="border border-gray-300 rounded px-3 py-1 text-sm focus:outline-none focus:border-blue-500">
-                    <option>すべての種類</option>
-                    <option>支払い</option>
-                    <option>サブスク</option>
-                  </select>
-                </div>
+                  <div className="flex items-center space-x-2">
+                    <Filter className="w-4 h-4 text-gray-500" />
+                    <select className="border border-gray-300 rounded px-3 py-1 text-sm focus:outline-none focus:border-blue-500">
+                      <option>すべてのカテゴリ</option>
+                      <option>食事・外食</option>
+                      <option>ショッピング</option>
+                      <option>交通費</option>
+                      <option>エンタメ</option>
+                      <option>サブスク</option>
+                    </select>
+                  </div>
 
-                <Button variant="outline" size="sm">リセット</Button>
-              </div>
-              {plan === 'FREE' && !devNoLimits && (
-                <div className="mt-2 text-xs text-gray-500">
-                  CSVエクスポートは当月のみ利用できます（有料で期間指定可）
-                </div>
-              )}
-            </CardContent>
-          </Card>
-        </div>
+                  <div className="flex items-center space-x-2">
+                    <select className="border border-gray-300 rounded px-3 py-1 text-sm focus:outline-none focus:border-blue-500">
+                      <option>すべての種類</option>
+                      <option>支払い</option>
+                      <option>サブスク</option>
+                    </select>
+                  </div>
 
-        {/* 取引一覧 */}
-        <Card>
+                  <Button variant="outline" size="sm">リセット</Button>
+                </div>
+                {plan === 'FREE' && !devNoLimits && (
+                  <div className="mt-2 text-xs text-gray-500">
+                    CSVエクスポートは当月のみ利用できます（有料で期間指定可）
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* 取引一覧 */}
+            <Card>
           <CardHeader>
             <CardTitle className="flex items-center">
               📱 取引一覧
@@ -298,7 +334,96 @@ export default async function TransactionsPage() {
               </div>
             </div>
           </CardContent>
-        </Card>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="categories" className="mt-6">
+            <Card>
+              <CardHeader>
+                <CardTitle>📊 カテゴリ別</CardTitle>
+                <CardDescription>今月の支出をカテゴリで集計</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="space-y-4">
+                  {categoryList.length === 0 && (
+                    <p className="text-sm text-gray-500">今月の取引がありません。</p>
+                  )}
+                  {categoryList.map((c, idx) => {
+                    const pct = totalAmount ? Math.round((c.amount / totalAmount) * 100) : 0
+                    const colors = ['bg-blue-500','bg-green-500','bg-amber-500','bg-purple-500','bg-sky-500','bg-rose-500']
+                    const barColor = colors[idx % colors.length]
+                    return (
+                      <div key={c.name} className="space-y-1">
+                        <div className="flex justify-between text-sm">
+                          <span>{c.name}</span>
+                          <span>¥{c.amount.toLocaleString()}（{pct}%）</span>
+                        </div>
+                        <div className="h-2 w-full rounded bg-gray-200 overflow-hidden">
+                          <div className={`h-full ${barColor}`} style={{ width: `${pct}%` }} />
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="search" className="mt-6">
+            <Card>
+              <CardHeader>
+                <CardTitle>🔎 高度検索</CardTitle>
+                <CardDescription>店舗名・金額・期間・カード等で検索</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <input className="border border-gray-300 rounded px-3 py-2 text-sm" placeholder="店舗名" />
+                  <input className="border border-gray-300 rounded px-3 py-2 text-sm" placeholder="金額（例: >1000）" />
+                  <input className="border border-gray-300 rounded px-3 py-2 text-sm" placeholder="期間（例: 2025-09〜2025-10）" />
+                  <input className="border border-gray-300 rounded px-3 py-2 text-sm" placeholder="カード名" />
+                </div>
+                <div className="mt-4 flex gap-2">
+                  <Button size="sm">検索</Button>
+                  <Button size="sm" variant="outline">条件をクリア</Button>
+                </div>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="calendar" className="mt-6">
+            <Card>
+              <CardHeader>
+                <CardTitle>📅 カレンダー</CardTitle>
+                <CardDescription>日別の支出を俯瞰</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="grid grid-cols-7 gap-1 text-xs">
+                  {['日','月','火','水','木','金','土'].map((w) => (
+                    <div key={w} className="p-1 text-center font-medium text-gray-500">{w}</div>
+                  ))}
+                  {cells.map((c, i) => (
+                    <div key={i} className="h-20 border rounded p-1 flex flex-col">
+                      {c.day ? (
+                        <>
+                          <div className="text-gray-600">{c.day}</div>
+                          {c.total ? (
+                            <div className="mt-auto text-right text-[10px] font-medium text-blue-700">
+                              ¥{c.total.toLocaleString()}
+                            </div>
+                          ) : (
+                            <div className="mt-auto text-right text-[10px] text-gray-300">—</div>
+                          )}
+                        </>
+                      ) : (
+                        <div className="text-gray-300">&nbsp;</div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
+          </TabsContent>
+        </Tabs>
 
         {/* アクションエリア */}
         <div className="mt-8">
